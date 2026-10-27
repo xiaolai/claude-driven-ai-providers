@@ -1,0 +1,8 @@
+{
+  "tests": {
+    "tiers": {
+      "edit": "bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh",
+      "pr": "bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh && bash tests/clcd-regression.sh && bash tests/bridge-api.sh"
+    }
+  }
+}

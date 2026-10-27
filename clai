@@ -1,0 +1,390 @@
+#!/bin/bash
+set -euo pipefail
+caller_umask=$(umask)
+umask 077
+root=$(cd "$(dirname "$0")" && pwd)
+config_root="${XDG_CONFIG_HOME:-$HOME/.config}/claude-driven-ai-providers"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-driven-ai-providers"
+registry="$root/providers.json"
+fail() { printf 'clai: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'HELP'
+Usage: clai list [--json]
+       clai prepare PROVIDER [--out FILE]
+       clai setup --env FILE [--dry-run|--probe] [--no-install] [--check-tools]
+       clai skill install [--profile PROVIDER|--dir DIRECTORY]
+       clai run PROVIDER [--] [Claude arguments...]
+       clai doctor [PROVIDER|all] [--network]
+       clai models PROVIDER
+       clai probe PROVIDER [--cached] [--model ID --check-tools]
+       clai map PROVIDER --strategy STRATEGY [tier/role overrides] [--apply] [--check-tools]
+       clai check PROVIDER [--model ID] [--tools]
+       clai config show PROVIDER
+       clai config set PROVIDER FIELD VALUE
+       clai config unset PROVIDER FIELD
+       clai key set PROVIDER [--stdin]
+       clai install [--bin DIRECTORY]
+
+Provider IDs and aliases: clai list
+Configuration fields: model, base_url (local only), context, compact, effort,
+max_output_tokens, protocol (local only: anthropic or chat).
+Effort: Codex/OpenAI low/medium/high/xhigh; Gemini low/medium/high.
+Keys are read from provider environment variables, then private mode-600 files.
+No key values are displayed. 'check' invokes a model and can incur API charges.
+Cloud context defaults: declared 1M, auto-compaction 75%; backend limits apply.
+Existing permission-bypass behavior is retained; providers never auto-fallback.
+HELP
+}
+command -v jq >/dev/null || fail 'jq is required'
+[ -f "$registry" ] || fail 'providers.json is missing; install the complete runtime'
+jq -e '.schema_version==1 and (.providers|type=="array")' "$registry" >/dev/null || fail 'invalid provider registry'
+
+private_file() {
+  local path=$1 mode owner
+  [ ! -L "$path" ] && [ -f "$path" ] || fail 'private configuration must be a regular file, not a symlink'
+  mode=$(stat -f '%Lp' "$path"); owner=$(stat -f '%u' "$path")
+  [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 077))" -eq 0 ] || fail 'private configuration must be owned by you and have no group/other permissions'
+}
+select_provider() {
+  local name=$1 mode=${2:-runtime} file overrides='{}' upper value prefix legacy_field
+  provider=$(jq -ce --arg name "$name" '.providers[]|select(.id==$name or .alias==$name or ((.legacy_aliases//[])|index($name)!=null))' "$registry") || fail 'unknown provider; run clai list'
+  id=$(printf '%s' "$provider" | jq -r .id)
+  if [ "$mode" = key ]; then cfg=$provider; return; fi
+  file="$config_root/providers/$id.json"
+  if [ -e "$file" ]; then private_file "$file"; overrides=$(cat "$file"); fi
+  printf '%s' "$overrides" | jq -e 'type=="object" and ((keys-["model","base_url","context","compact","effort","max_output_tokens","protocol","mapping"])|length==0)' >/dev/null || fail 'unknown or invalid private config fields'
+  cfg=$(printf '%s' "$provider" | jq -c --argjson overrides "$overrides" '.+$overrides')
+  if [ "$mode" = runtime ]; then
+    upper=$(printf '%s' "$id" | tr '[:lower:]-' '[:upper:]_')
+    for field in model base_url context compact effort max_output_tokens; do
+      prefix="CLAI_${upper}_$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]')"
+      value=${!prefix:-}
+      if [ -n "$value" ]; then cfg=$(printf '%s' "$cfg" | jq -c --arg k "$field" --arg v "$value" '.+{($k):$v}'); fi
+    done
+    case "$id" in
+      codex) value=${CLCD_MODEL:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.model=$v')
+        value=${CLCD_CONTEXT_TOKENS:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.context=$v')
+        value=${CLCD_EFFORT:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.effort=$v');;
+      deepseek) value=${CLDS_MODEL:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.model=$v');;
+      local-deepseek)
+        for field in MODEL BASE_URL CONTEXT_TOKENS MAX_OUTPUT_TOKENS API_TIMEOUT_MS; do
+          prefix="CLDLS_$field"; value=${!prefix:-}
+          prefix="CLLDS_$field"; value=${value:-${!prefix:-}}
+          legacy_field=$(printf '%s' "$field" | tr '[:upper:]' '[:lower:]')
+          [ "$field" != CONTEXT_TOKENS ] || legacy_field=context
+          [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg k "$legacy_field" --arg v "$value" '.+{($k):$v}')
+        done;;
+    esac
+  fi
+  file=$(printf '%s' "$provider"|jq -r '.legacy_url_file//empty')
+  if [ -n "$file" ] && [ "$(printf '%s' "$cfg"|jq -r .base_url)" = '' ] && [ -f "$config_root/$file" ]; then
+    private_file "$config_root/$file"
+    value=$(cat "$config_root/$file")
+    cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.base_url=$v')
+  fi
+  if [ "$mode" = edit ]; then return; fi
+  if [ "$mode" = runtime ] && [ -n "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ]; then
+    cfg=$(printf '%s' "$cfg"|jq -c --arg v "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" '.compact=($v|tonumber)') || fail 'auto-compact override must be a token count'
+  fi
+  validate_config
+}
+validate_config() {
+  if printf '%s' "$cfg"|jq -e '.mapping!=null' >/dev/null;then
+    printf '%s' "$cfg"|jq -e '.mapping|type=="object" and (.strategy|IN("single","quality","balanced","economy","manual")) and
+      (.models|type=="object" and length>0 and ((keys-["opus","fable","sonnet","haiku","subagent","custom"])|length==0) and all(.[];type=="string" and length>0 and length<=512 and (test("[[:cntrl:]]")|not))) and
+      all([.bounds.context_tokens,.bounds.output_tokens][];.==null or (type=="number" and .>0 and .==floor)) and
+      (.bounds.effort_levels==null or (.bounds.effort_levels|type=="array" and length>0 and all(.[];IN("low","medium","high","xhigh"))))' >/dev/null || fail 'invalid provider role mapping'
+  fi
+  cfg=$(printf '%s' "$cfg"|jq -ce '.context|=tonumber | (.compact==null) as $derived_compact | .compact=((.compact // ((.context*0.75)|floor))|tonumber) |
+    .max_output_tokens=(if .max_output_tokens!=null then (.max_output_tokens|tonumber) elif .protocol=="anthropic" then null else 4096 end) |
+    if .mapping.bounds.context_tokens!=null then .context=([.context,.mapping.bounds.context_tokens]|min) | if $derived_compact or .compact>.context then .compact=((.context*0.75)|floor) else . end else . end |
+    if .mapping.bounds.output_tokens!=null then .max_output_tokens=([(.max_output_tokens//.mapping.bounds.output_tokens),.mapping.bounds.output_tokens,.context]|min) else . end |
+    .effort=(.effort//.mapping.default_effort)') || fail 'context, compact and max_output_tokens must be numbers'
+  printf '%s' "$cfg"|jq -e '.context>=1000 and .context<=2000000 and .context==(.context|floor) and .compact>0 and .compact<=.context and .compact==(.compact|floor) and
+    (.max_output_tokens==null or (.max_output_tokens>0 and .max_output_tokens<=.context and .max_output_tokens==(.max_output_tokens|floor))) and
+    (.protocol|IN("anthropic","responses","chat")) and (.model|type=="string") and (.base_url|type=="string")' >/dev/null || fail 'invalid context/compact/output/protocol configuration'
+  if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then
+    printf '%s' "$cfg"|jq -e '.effort as $effort | (.effort_levels//[])|index($effort)!=null' >/dev/null || fail 'reasoning effort is unsupported for this route/value; remove it with config unset or use a supported provider'
+    printf '%s' "$cfg"|jq -e '.effort as $effort | .mapping.bounds.effort_levels==null or (.mapping.bounds.effort_levels|index($effort)!=null)' >/dev/null || fail 'effort is unsupported by one or more mapped models'
+  fi
+  if [ "$(printf '%s' "$provider"|jq -r .auth)" != local ]; then
+    [ "$(printf '%s' "$cfg"|jq -r .base_url)" = "$(printf '%s' "$provider"|jq -r .base_url)" ] || fail 'cloud endpoints are pinned to their documented official origin'
+    [ "$(printf '%s' "$cfg"|jq -r .protocol)" = "$(printf '%s' "$provider"|jq -r .protocol)" ] || fail 'cloud protocol cannot be overridden'
+  fi
+}
+read_key() {
+  local name file secret='' alternate
+  key_source=none credential=''
+  name=$(printf '%s' "$provider"|jq -r '.key_env//""')
+  alternate=$(printf '%s' "$provider"|jq -r '.alt_env//""')
+  if [ -n "$name" ]; then secret=${!name:-}; fi
+  if [ -z "$secret" ] && [ -n "$alternate" ]; then secret=${!alternate:-}; fi
+  if [ -n "$secret" ]; then key_source=environment; else
+    file=$(printf '%s' "$provider"|jq -r '.key_file//""')
+    if [ -n "$file" ] && [ -e "$config_root/$file" ]; then private_file "$config_root/$file"; secret=$(cat "$config_root/$file"); key_source=private-file; fi
+  fi
+  if [ -n "$secret" ]; then
+    [[ "$secret" =~ ^[A-Za-z0-9._~+/:=-]+$ ]] || fail 'credential contains unsupported whitespace/control/quoting characters'
+  fi
+  credential=$secret
+}
+validate_url() {
+  local url=$1
+  jq -en --arg url "$url" '$url|test("^https?://(\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9_.-]+)(:[0-9]{1,5})?(/[^\\s?#]*)?$")' >/dev/null || fail 'invalid provider URL (userinfo, query and fragments are not allowed)'
+  if [[ "$url" == http://* ]] && [ -n "${credential:-}" ]; then
+    [[ "$url" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]] || fail 'credentials over plain HTTP are allowed only on numeric loopback'
+  fi
+}
+net_get() {
+  local url=$1 header=${2:-Authorization} file=$3 query_key=${4:-} query_value=${5:-} prefix='Bearer '
+  [ "$header" = Authorization ] || prefix=''
+  validate_url "$url"
+  if [ -n "$query_key" ];then
+    [ "$query_key" = pageToken ] || fail 'unsupported model pagination parameter'
+    url="$url?pageToken=$(printf '%s' "$query_value"|jq -sRr @uri)"
+  fi
+  if [ -n "$credential" ]; then
+    printf 'header = "%s: %s%s"\n' "$header" "$prefix" "$credential" |
+      curl --config - --silent --show-error --connect-timeout 5 --max-time 20 --max-redirs 0 --proto '=https,http' -o "$file" -w '%{http_code}' "$url"
+  else
+    curl --silent --show-error --connect-timeout 5 --max-time 20 --max-redirs 0 --proto '=https,http' -o "$file" -w '%{http_code}' "$url"
+  fi
+}
+models_url() {
+  url=$(printf '%s' "$cfg"|jq -r '.models_url//""')
+  if [ "$(printf '%s' "$provider"|jq -r .auth)" = local ]; then
+    url=$(printf '%s' "$cfg"|jq -r .base_url)
+    url=${url%/}; url=${url%/v1}
+    [ -z "$url" ] || { if [ "$id" = ollama ]; then url="$url/api/tags"; else url="$url/v1/models"; fi; }
+  fi
+}
+doctor() {
+  local tmp status state missing='' tool auth_type protocol
+  read_key
+  auth_type=$(printf '%s' "$cfg"|jq -r .auth); protocol=$(printf '%s' "$cfg"|jq -r .protocol)
+  for tool in claude curl jq; do command -v "$tool" >/dev/null || missing="$missing $tool"; done
+  if [ "$protocol" != anthropic ]; then for tool in socat openssl; do command -v "$tool" >/dev/null || missing="$missing $tool"; done; fi
+  if [ "$auth_type" = subscription ]; then for tool in codex lockf; do command -v "$tool" >/dev/null || missing="$missing $tool"; done; fi
+  state=configured
+  [ -z "$missing" ] || state="missing-tools"
+  if [ "$auth_type" = api ] && [ -z "$credential" ]; then state="missing-key"; fi
+  if [ "$auth_type" = local ] && { [ "$(printf '%s' "$cfg"|jq -r .base_url)" = '' ] || [ "$(printf '%s' "$cfg"|jq -r .model)" = '' ]; }; then state=needs-local-configuration; fi
+  if [ "$network" = true ] && [ "$state" = configured ]; then
+    if [ "$auth_type" = subscription ]; then
+      if login_state=$(codex login status 2>&1) && [[ "$login_state" == *ChatGPT* ]]; then state=signed-in-not-generation-tested; else state=not-signed-in-with-chatgpt; fi
+    else
+      models_url
+      if [ -z "$url" ]; then state=no-model-discovery-route; else
+        tmp=$(mktemp)
+        status=$(net_get "$url" "$(printf '%s' "$provider"|jq -r '.models_header//"Authorization"')" "$tmp") || status="network-error"
+        case "$status" in 200) state=reachable-not-generation-tested;;
+          400) if jq -e 'tostring|test("location|region";"i")' "$tmp" >/dev/null 2>&1; then state="provider-location-blocked"; else state=http-400; fi;;
+          403) if jq -e 'tostring|test("credit|spending|billing";"i")' "$tmp" >/dev/null 2>&1; then state="provider-billing-blocked"; else state=http-403; fi;;
+          *) state="http-$status";; esac
+        rm -f -- "$tmp"
+      fi
+    fi
+  fi
+  jq -cn --arg provider "$id" --arg state "$state" --arg source "$key_source" --arg tools "$missing" '{provider:$provider,state:$state,credential_source:$source,missing_tools:$tools}'
+  case "$state" in configured|reachable-not-generation-tested|signed-in-not-generation-tested|no-model-discovery-route) return 0;; *) return 1;; esac
+}
+scrub_provider_keys() {
+  local name
+  while IFS= read -r name; do
+    [ -z "$name" ] || unset "$name"
+  done < <(jq -r '.providers[]|.key_env,.alt_env//empty' "$registry")
+}
+run_provider() {
+  if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage; printf 'Provider: %s\n' "$id"; umask "$caller_umask"; exec claude --help; fi
+  local protocol auth_type selected base context compact effort profile output bridge_transport
+  read_key
+  protocol=$(printf '%s' "$cfg"|jq -r .protocol); auth_type=$(printf '%s' "$cfg"|jq -r .auth)
+  selected=$(printf '%s' "$cfg"|jq -r .model); base=$(printf '%s' "$cfg"|jq -r .base_url)
+  context=$(printf '%s' "$cfg"|jq -r .context); compact=$(printf '%s' "$cfg"|jq -r .compact); effort=$(printf '%s' "$cfg"|jq -r '.effort//"medium"')
+  [ -n "$selected" ] || fail 'model is not configured; use clai models and clai config set'
+  [ "$auth_type" != api ] || [ -n "$credential" ] || fail 'provider key is missing; use clai key set'
+  profile="$HOME/$(printf '%s' "$cfg"|jq -r .profile)"
+  output=$(printf '%s' "$cfg"|jq -r .max_output_tokens)
+  if [ "$protocol" != anthropic ]; then
+    bridge_transport=$id
+    case "$id" in codex|openai|grok|gemini|local) ;;
+      *) if [ "$protocol" = chat ]; then bridge_transport=chat; else bridge_transport=api; fi;;
+    esac
+    if [ "$auth_type" = local ] && [ "$protocol" = chat ]; then bridge_transport=local; fi
+    export CLCD_API_URL="$base" CLCD_CONFIG_RESOLVED=1
+    CLCD_MODEL_MAP=$(printf '%s' "$cfg"|jq -c '.mapping.models//{}');export CLCD_MODEL_MAP
+    export CLCD_TRANSPORT="$bridge_transport" CLCD_MODEL="$selected" CLCD_CONTEXT_TOKENS="$context" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact" CLCD_PROFILE="$profile" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$output"
+    if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then export CLCD_EFFORT="$effort"; else unset CLCD_EFFORT; fi
+    export CLCD_API_KEY="$credential"
+    scrub_provider_keys
+    if [ "$protocol" = chat ]; then
+      if [ "$id" != gemini ]; then
+        case "${base%/}" in */v1) base="${base%/}/chat/completions";; *) base="${base%/}/v1/chat/completions";; esac
+      fi
+      export CLCD_CHAT_URL="$base" CLCD_ADAPTER_DIR="$root/adapters" CLCD_CHAT_CACHE="$cache_root/$id"
+    fi
+    umask "$caller_umask"
+    exec "$root/clcd" "$@"
+  fi
+  [ -n "$base" ] || fail 'local base URL is not configured; use clai config set'
+  validate_url "$base"
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
+  unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_EFFORT_LEVEL
+  if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then export CLAUDE_CODE_EFFORT_LEVEL="$effort"; fi
+  export CLAUDE_CONFIG_DIR="$profile"
+  export ANTHROPIC_BASE_URL="${base%/}" ANTHROPIC_AUTH_TOKEN="${credential:-local-provider}"
+  if [ "$id" = minimax ]; then export ANTHROPIC_API_KEY="$credential"; unset ANTHROPIC_AUTH_TOKEN; fi
+  export ANTHROPIC_MODEL="$selected" ANTHROPIC_DEFAULT_MODEL="$selected"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected" ANTHROPIC_DEFAULT_FABLE_MODEL="$selected" ANTHROPIC_DEFAULT_SONNET_MODEL="$selected" ANTHROPIC_DEFAULT_HAIKU_MODEL="$selected" CLAUDE_CODE_SUBAGENT_MODEL="$selected"
+  if [ "$id" = local-deepseek ]; then
+    local mapping variable alias mapped
+    for mapping in ANTHROPIC_DEFAULT_OPUS_MODEL:opus ANTHROPIC_DEFAULT_FABLE_MODEL:fable ANTHROPIC_DEFAULT_SONNET_MODEL:sonnet ANTHROPIC_DEFAULT_HAIKU_MODEL:haiku CLAUDE_CODE_SUBAGENT_MODEL:subagent ANTHROPIC_CUSTOM_MODEL_OPTION:custom; do
+      variable=${mapping%:*}; alias=${mapping#*:}
+      mapped=$(printf '%s' "$cfg"|jq -r --arg alias "$alias" --arg selected "$selected" '.aliases[$alias]//$selected')
+      export "$variable=$mapped"
+    done
+    if [ "$selected" = cyberneurova-fast ]; then unset ANTHROPIC_MODEL; fi
+    export ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=thinking ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES=thinking ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES=thinking ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES=''
+    export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=thinking
+    API_TIMEOUT_MS=$(printf '%s' "$cfg"|jq -r '.api_timeout_ms//7200000'); export API_TIMEOUT_MS
+  fi
+  if printf '%s' "$cfg"|jq -e '.mapping!=null' >/dev/null;then
+    local mapping_role mapping_var mapping_model
+    for mapping_role in opus fable sonnet haiku subagent custom;do
+      case "$mapping_role" in subagent) mapping_var=CLAUDE_CODE_SUBAGENT_MODEL;;custom) mapping_var=ANTHROPIC_CUSTOM_MODEL_OPTION;;*) mapping_var="ANTHROPIC_DEFAULT_$(printf '%s' "$mapping_role"|tr '[:lower:]' '[:upper:]')_MODEL";;esac
+      mapping_model=$(printf '%s' "$cfg"|jq -r --arg role "$mapping_role" --arg default "$selected" '.mapping.models[$role]//$default')
+      export "$mapping_var=$mapping_model"
+      if [ "$id" = local-deepseek ];then
+        # Legacy thinking flags apply only to the gateway's known role aliases.
+        case "$mapping_role" in opus|fable|sonnet|haiku) mapping_var="${mapping_var}_SUPPORTED_CAPABILITIES";;custom) mapping_var=ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES;;*) continue;;esac
+        case "$mapping_model" in cyberneurova-high|cyberneurova-medium) export "$mapping_var=thinking";;*) export "$mapping_var=";;esac
+      fi
+    done
+  fi
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$context" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact"
+  if [ "$output" = null ]; then unset CLAUDE_CODE_MAX_OUTPUT_TOKENS; else export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$output"; fi
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ENABLE_TOOL_SEARCH=false
+  scrub_provider_keys
+  umask "$caller_umask"
+  exec claude --dangerously-skip-permissions "$@"
+}
+install_runtime() {
+  local bin=${1:-$HOME/.local/bin} data stage release alias target qtarget
+  data="${XDG_DATA_HOME:-$HOME/.local/share}/claude-driven-ai-providers"
+  printf 'Installing runtime from %s\n' "$root"
+  mkdir -p "$bin" "$data/releases"
+  stage=$(mktemp -d "$data/releases/.stage.XXXXXXXX")
+  cp "$root/clai" "$root/clcd" "$root/clds" "$root/cldls" "$root/providers.json" "$root/setup.sh" "$root/models.sh" "$stage/"
+  cp -R "$root/adapters" "$stage/"
+  cp -R "$root/skills" "$stage/"
+  chmod 755 "$stage/clai" "$stage/clcd" "$stage/clds" "$stage/cldls"
+  release="$data/releases/$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 4)"
+  mv "$stage" "$release"
+  for alias in clai $(jq -r '.providers[]|.alias, .legacy_aliases[]? | select(.!="clcd")' "$registry"); do
+    stage=$(mktemp "$bin/.${alias}.XXXXXXXX")
+    if [ "$alias" = clai ]; then
+      printf -v qtarget '%q' "$release/clai"
+      printf '#!/bin/bash\nexec %s "$@"\n' "$qtarget" >"$stage"
+    else
+      target=$(jq -r --arg alias "$alias" '.providers[]|select(.alias==$alias or ((.legacy_aliases//[])|index($alias)!=null))|.id' "$registry")
+      printf -v qtarget '%q' "$release/clai"
+      printf '#!/bin/bash\nexec %s run %q -- "$@"\n' "$qtarget" "$target" >"$stage"
+    fi
+    chmod 755 "$stage"; mv -f "$stage" "$bin/$alias"
+  done
+  stage=$(mktemp "$bin/.clcd.XXXXXXXX"); install -m 755 "$release/clcd" "$stage"; mv -f "$stage" "$bin/clcd"
+  printf 'Installed provider commands in %s; existing sessions retain their loaded runtime.\n' "$bin"
+}
+command=${1:-help}; [ "$#" -eq 0 ] || shift
+case "$command" in
+  help|--help|-h) usage;;
+  prepare|setup|skill)
+    # shellcheck source=setup.sh
+    source "$root/setup.sh"
+    case "$command" in
+      prepare) prepare_setup "$@";; setup) apply_setup "$@";;
+      skill) [ "${1:-}" = install ] || fail 'usage: clai skill install [--profile PROVIDER|--dir DIRECTORY]'; shift; install_setup_skill "$@";;
+    esac;;
+  list)
+    if [ "${1:-}" = --json ]; then jq . "$registry"; else jq -r '.providers[]|[.id,.alias,.protocol,.auth,.model]|@tsv' "$registry"; fi;;
+  run)
+    [ "$#" -gt 0 ] || fail 'provider required'; select_provider "$1"; shift
+    [ "${1:-}" != -- ] || shift
+    if [ "$id" = deepseek ] && [ "${1:-}" = --update-models ]; then exec "$root/clai" models "$id"; else run_provider "$@"; fi;;
+  doctor)
+    name=${1:-all}; network=false
+    for arg in "$@"; do [ "$arg" != --network ] || network=true; done
+    [ "$name" != --network ] || name=all
+    if [ "$name" = all ]; then while IFS= read -r name; do (select_provider "$name"; doctor) || true; done < <(jq -r '.providers[].id' "$registry")
+    else select_provider "$name"; doctor; fi;;
+  models|probe|map)
+    [ "$#" -ge 1 ] || fail 'provider required';if [ "$command" = map ];then select_provider "$1" stored;else select_provider "$1";fi;shift
+    # shellcheck source=models.sh
+    source "$root/models.sh"
+    case "$command" in models) [ "$#" -eq 0 ] || fail 'usage: clai models PROVIDER';inventory=$(model_inventory false) || { printf '%s\n' "$inventory" >&2;exit 1; };printf '%s' "$inventory"|jq -er '.models[].id';;probe) probe_provider "$@";;map) map_provider "$@";;esac;;
+  config)
+    action=${1:-}; name=${2:-}; [ -n "$name" ] || fail 'usage: clai config show|set PROVIDER [FIELD VALUE]'
+    if [ "$action" = show ]; then select_provider "$name" stored; else select_provider "$name" edit; fi
+    case "$action" in
+      show) printf '%s\n' "$cfg"|jq .;;
+      set|unset)
+        if [ "$action" = set ]; then [ "$#" -eq 4 ] || fail 'usage: clai config set PROVIDER FIELD VALUE'; else [ "$#" -eq 3 ] || fail 'usage: clai config unset PROVIDER FIELD'; fi
+        field=$3; value=${4:-}
+        case "$field" in model|base_url|context|compact|effort|max_output_tokens|protocol) ;; mapping) [ "$action" = unset ] || fail 'use clai map to set mappings';; *) fail 'unsupported configuration field (keys use clai key set)';; esac
+        mkdir -p "$config_root/providers"; chmod 700 "$config_root" "$config_root/providers"
+        file="$config_root/providers/$id.json"; old='{}'; if [ -e "$file" ]; then private_file "$file"; old=$(cat "$file"); fi
+        if [ "$action" = set ]; then changed=$(printf '%s' "$old"|jq -c --arg k "$field" --arg v "$value" '.+{($k):$v}'); else changed=$(printf '%s' "$old"|jq -c --arg k "$field" 'del(.[$k])'); fi
+        # Validate without writing a potentially broken profile over the old one.
+        if [ "$action" = set ]; then case "$field" in
+          context|compact|max_output_tokens) [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] || fail 'expected a positive integer';;
+          effort) case "$value" in low|medium|high|xhigh) ;; *) fail 'unsupported effort';; esac;;
+          base_url|protocol) [ "$(printf '%s' "$provider"|jq -r .auth)" = local ] || fail 'only local provider endpoints/protocols are configurable'; if [ "$field" = base_url ]; then credential=''; validate_url "$value"; else case "$value" in anthropic|chat) ;; *) fail 'local protocol must be anthropic or chat';; esac; fi;;
+        esac; fi
+        cfg=$(printf '%s' "$provider"|jq -c --argjson changes "$changed" '.+$changes')
+        validate_config
+        stage=$(mktemp "$config_root/providers/.${id}.XXXXXXXX"); printf '%s\n' "$changed" >"$stage"; chmod 600 "$stage"; mv -f "$stage" "$file"
+        printf 'Saved %s configuration for %s.\n' "$field" "$id";;
+      *) fail 'config action must be show, set or unset';; esac;;
+  key)
+    [ "${1:-}" = set ] && [ -n "${2:-}" ] || fail 'usage: clai key set PROVIDER [--stdin]'
+    select_provider "$2" key; file=$(printf '%s' "$provider"|jq -r .key_file)
+    [ -n "$file" ] || fail 'this route does not use a stored API key'
+    secret=''
+    if [ "${3:-}" = --stdin ]; then IFS= read -r secret || [ -n "$secret" ]; else IFS= read -r -s -p 'API key (hidden): ' secret </dev/tty; printf '\n' >&2; fi
+    [[ "$secret" =~ ^[A-Za-z0-9._~+/:=-]+$ ]] || fail 'empty or invalid key characters'
+    mkdir -p "$config_root"; chmod 700 "$config_root"
+    stage=$(mktemp "$config_root/.${file}.XXXXXXXX"); printf '%s\n' "$secret" >"$stage"; chmod 600 "$stage"; mv -f "$stage" "$config_root/$file"; unset secret
+    printf 'Stored private credential for %s; value not displayed.\n' "$id";;
+  check)
+    [ -n "${1:-}" ] || fail 'usage: clai check PROVIDER [--tools]'
+    name=$1;shift;tool_check='';check_model='';check_effort='';check_context='';check_output='';check_args=()
+    while [ "$#" -gt 0 ];do
+      case "$1" in --tools) tool_check=--tools;;
+        --model|--effort|--context|--max-output-tokens) [ "$#" -ge 2 ] || fail 'check option needs a value';case "$1" in --model) check_model=$2;;--effort) check_effort=$2;;--context) check_context=$2;;*) check_output=$2;;esac;shift;;
+        *) fail 'unknown check option';;
+      esac;shift
+    done
+    if [ -z "$check_model" ] && [ -n "$check_effort$check_context$check_output" ];then fail 'check bounds/effort require --model';fi
+    if [ -n "$check_model" ];then check_args=(--model "$check_model");fi
+    tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
+    expected="CLAI_OK_$(openssl rand -hex 4)"
+    prompt="Reply with exactly $expected"; tools=''; turns=1
+    if [ "$tool_check" = --tools ]; then prompt="Use Bash to run printf with the literal text $expected, then reply with only that exact text. You must use Bash."; tools=Bash; turns=3; fi
+    (cd "$tmp"
+      if [ -n "$check_model" ];then
+        select_provider "$name" edit
+        cfg=$(printf '%s' "$cfg"|jq -c --arg model "$check_model" --arg effort "$check_effort" --arg context "$check_context" --arg output "$check_output" '
+          del(.mapping)|.model=$model|if $effort!="" then .effort=$effort else . end|
+          if $context!="" then .context=($context|tonumber)|.compact=((.context*0.75)|floor) else . end|
+          if $output!="" then .max_output_tokens=($output|tonumber) else . end')
+        validate_config
+        run_provider "${check_args[@]}" --safe-mode --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence --tools "$tools" --max-turns "$turns" --output-format json -p "$prompt"
+      else "$root/clai" run "$name" -- --safe-mode --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence --tools "$tools" --max-turns "$turns" --output-format json -p "$prompt";fi
+    ) >"$tmp/result" || fail 'live provider check failed'
+    jq -e --arg expected "$expected" --arg tools "$tools" '.is_error==false and .result==$expected and (if $tools=="" then true else .num_turns>=2 end)' "$tmp/result" >/dev/null || fail 'live check did not meet text/tool acceptance criteria'
+    printf 'PASS: %s live %s check.\n' "$name" "${tool_check:---text}";;
+  install)
+    bin="$HOME/.local/bin"; if [ "${1:-}" = --bin ]; then [ -n "${2:-}" ] || fail '--bin needs a directory'; bin=$2; fi
+    install_runtime "$bin";;
+  *) fail 'unknown command; run clai --help';;
+esac

@@ -1,0 +1,163 @@
+#!/bin/bash
+set -euo pipefail
+
+# Use the common manager when installed alongside it; retain standalone fallback.
+managed_root=$(cd "$(dirname "$0")" && pwd)
+if [ "${CLAI_STANDALONE:-0}" != 1 ] && [ -x "$managed_root/clai" ] && [ -f "$managed_root/providers.json" ]; then
+  if [ "${1:-}" = --update-models ]; then exec "$managed_root/clai" models deepseek; fi
+  exec "$managed_root/clai" run deepseek -- "$@"
+fi
+
+# Refresh model aliases from DeepSeek's official documentation, then exit.
+if [[ "${1:-}" == '--update-models' ]]; then
+  if [[ $# -ne 1 ]]; then
+    printf 'Usage: clds --update-models\n' >&2
+    exit 2
+  fi
+  exec python3 - "$0" <<'PYUPDATE'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+import urllib.request
+from html.parser import HTMLParser
+
+URL = 'https://api-docs.deepseek.com/quick_start/pricing/'
+
+class ModelTable(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.row = None
+        self.cell = None
+    def handle_starttag(self, tag, attrs):
+        if tag == 'tr':
+            self.row = []
+        elif tag in ('td', 'th') and self.row is not None:
+            self.cell = []
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th') and self.cell is not None:
+            self.row.append(' '.join(''.join(self.cell).split()))
+            self.cell = None
+        elif tag == 'tr' and self.row is not None:
+            self.rows.append(self.row)
+            self.row = None
+
+def update():
+    req = urllib.request.Request(URL, headers={'User-Agent': 'clds-model-updater/1'})
+    with urllib.request.urlopen(req, timeout=25) as response:
+        html = response.read(2_000_001)
+    if len(html) > 2_000_000:
+        raise ValueError('documentation response exceeds size limit')
+    parser = ModelTable()
+    parser.feed(html.decode('utf-8'))
+    model_row = next((r for r in parser.rows if r and r[0] == 'MODEL'), None)
+    if model_row is None:
+        raise ValueError('cannot find the official model table')
+    models = []
+    for cell in model_row[1:]:
+        match = re.match(r'^(deepseek-[a-z0-9-]+)(?:\s|\(|$)', cell)
+        if not match:
+            raise ValueError('unrecognized model name in official table')
+        models.append(match.group(1))
+    flash = [m for m in models if m.endswith('-flash')]
+    if len(flash) != 1:
+        raise ValueError('expected exactly one Flash model')
+    context = next((r for r in parser.rows if r and r[0] == 'CONTEXT LENGTH'), [])
+    if not context[1:] or any(c != '1M' for c in context[1:]):
+        raise ValueError('context configuration changed; review documentation manually')
+    replacements = {
+        'ANTHROPIC_MODEL': flash[0] + '[1m]',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL': flash[0] + '[1m]',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL': flash[0] + '[1m]',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL': flash[0] + '[1m]',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL': flash[0] + '[1m]',
+        'CLAUDE_CODE_SUBAGENT_MODEL': flash[0] + '[1m]',
+    }
+    path = Path(sys.argv[1]).resolve()
+    original = path.read_text()
+    updated = original
+    for name, model in replacements.items():
+        updated, count = re.subn(r'^export ' + name + r'=.*$',
+                                 "export " + name + "='" + model + "'",
+                                 updated, flags=re.M)
+        if count != 1:
+            raise ValueError('expected one assignment for ' + name)
+    if updated != original:
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
+                                              prefix='.clds-', delete=False) as f:
+                temp_path = Path(f.name)
+                os.fchmod(f.fileno(), stat.S_IRWXU)
+                f.write(updated)
+                f.flush()
+                os.fsync(f.fileno())
+            if path.read_text() != original:
+                raise ValueError('script changed during update; retry')
+            os.replace(temp_path, path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        print('Updated model mappings.')
+    else:
+        print('Model mappings are already current.')
+    versions = next((r for r in parser.rows if r and r[0] == 'MODEL VERSION'), [])
+    for i, model in enumerate(models):
+        version = versions[i + 1] if i + 1 < len(versions) else 'version not listed'
+        print(model + ' -> ' + version)
+    print('Source: ' + URL)
+
+try:
+    update()
+except Exception as error:
+    print('clds: model update failed; script unchanged: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYUPDATE
+fi
+
+if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
+  printf 'Usage: clds [Claude Code arguments]\n       clds --update-models\n\nUses a separate DeepSeek profile with permission checks bypassed.\n\n'
+  exec claude --help
+fi
+
+
+# Credentials stay outside the repository; an explicit environment value wins.
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  key_file="${XDG_CONFIG_HOME:-$HOME/.config}/claude-driven-ai-providers/deepseek-api-key"
+  if [[ -r "$key_file" ]]; then
+    DEEPSEEK_API_KEY=$(cat "$key_file")
+  fi
+fi
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  printf 'clds: set DEEPSEEK_API_KEY or configure the private deepseek-api-key file.\n' >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  printf 'clds: claude is not on PATH. Install Claude Code first.\n' >&2
+  exit 127
+fi
+
+export CLAUDE_CONFIG_DIR="$HOME/.claude-deepseek"
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+unset CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS
+unset CLAUDE_CODE_EFFORT_LEVEL
+export ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic'
+export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY"
+export ANTHROPIC_MODEL='deepseek-flash[1m]'
+export ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek-flash[1m]'
+export ANTHROPIC_DEFAULT_FABLE_MODEL='deepseek-flash[1m]'
+export ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek-flash[1m]'
+export ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-flash[1m]'
+export CLAUDE_CODE_SUBAGENT_MODEL='deepseek-flash[1m]'
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW='786432'
+
+exec claude --dangerously-skip-permissions "$@"

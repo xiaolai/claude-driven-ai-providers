@@ -1,0 +1,590 @@
+#!/bin/bash
+# Claude Code Messages bridge; macOS /bin/bash 3.2 compatible.
+set -euo pipefail
+caller_umask=$(umask)
+caller_lc_all=${LC_ALL-}
+caller_lc_all_set=${LC_ALL+x}
+export LC_ALL=C
+
+usage() {
+  cat <<'HELP'
+Usage: clcd [Claude Code arguments]
+       clcd --check
+
+Runs Claude Code through a private, local Anthropic-to-Codex bridge.
+Uses your existing `codex login` ChatGPT subscription, without an API key.
+Default model: gpt-6.1-sol. Set CLCD_MODEL or pass --model to select another.
+CLCD_EFFORT: low, medium (default), high, xhigh.
+CLCD_CONTEXT_TOKENS: Claude's context limit (default: 1000000).
+CLCD_HEADER_TIMEOUT: upstream response-header deadline (default: 120 seconds).
+CLAUDE_CODE_AUTO_COMPACT_WINDOW: default 750000 tokens (75% of 1M).
+Claude profile: ~/.claude-codex. Permission checks are bypassed, as in clds.
+
+Requires macOS bash, curl, jq, socat, openssl, lockf, codex, and claude.
+No external proxy, SDK, or persistent subscription token copy.
+CLCD_TRANSPORT=codex (default), openai, or grok selects explicit billing/auth.
+Gemini/local chat routes use the optional installed adapters via clai.
+Supports text, images, function tools, and streaming. Token counts are estimates
+when Claude requests /count_tokens. Unsupported input blocks fail explicitly.
+Claude's adaptive effort is translated; CLCD_EFFORT overrides it when set.
+max_tokens is advisory for subscription requests, enforced for API requests.
+Fixed thinking budgets, sampling and schema controls
+are rejected because this bridge cannot honor them.
+HELP
+}
+
+die() { printf 'clcd: %s\n' "$*" >&2; exit 1; }
+case "${1:-}" in --help|-h) usage; exit 0;; esac
+transport=${CLCD_TRANSPORT:-codex}
+case "$transport" in codex|openai|grok|gemini|local|api|chat) ;; *) die 'unsupported CLCD_TRANSPORT';; esac
+required_tools="curl jq socat openssl claude"
+[ "$transport" != codex ] || required_tools="$required_tools lockf codex"
+for tool in $required_tools; do
+  command -v "$tool" >/dev/null || die "$tool is not on PATH"
+done
+if [ "$transport" = codex ]; then
+  CLCD_MODEL=${CLCD_MODEL:-${CLAI_CODEX_MODEL:-}}
+  CLCD_CONTEXT_TOKENS=${CLCD_CONTEXT_TOKENS:-${CLAI_CODEX_CONTEXT:-}}
+  CLCD_EFFORT=${CLCD_EFFORT:-${CLAI_CODEX_EFFORT:-}}
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW=${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-${CLAI_CODEX_COMPACT:-}}
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS=${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-${CLAI_CODEX_MAX_OUTPUT_TOKENS:-}}
+fi
+# The standalone subscription launcher also honors the manager's private profile.
+model_map=${CLCD_MODEL_MAP:-'{}'}
+mapping_bounds='{}'
+profile_file="${XDG_CONFIG_HOME:-$HOME/.config}/claude-driven-ai-providers/providers/$transport.json"
+if [ "${CLCD_CONFIG_RESOLVED:-0}" != 1 ] && [ -f "$profile_file" ]; then
+  [ ! -L "$profile_file" ] && [ "$(stat -f '%u' "$profile_file")" = "$(id -u)" ] && [ "$((8#$(stat -f '%Lp' "$profile_file") & 077))" -eq 0 ] || die 'provider configuration must be private and owned by you'
+  [ -n "${CLCD_MODEL:-}" ] || CLCD_MODEL=$(jq -r '.model//empty' "$profile_file")
+  [ -n "${CLCD_CONTEXT_TOKENS:-}" ] || CLCD_CONTEXT_TOKENS=$(jq -r '.context//empty' "$profile_file")
+  [ -n "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] || CLAUDE_CODE_AUTO_COMPACT_WINDOW=$(jq -r '.compact//empty' "$profile_file")
+  [ -n "${CLCD_EFFORT:-}" ] || CLCD_EFFORT=$(jq -r '.effort//.mapping.default_effort//empty' "$profile_file")
+  [ -n "${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}" ] || CLAUDE_CODE_MAX_OUTPUT_TOKENS=$(jq -r '.max_output_tokens//empty' "$profile_file")
+  [ -n "${CLCD_MODEL_MAP:-}" ] || model_map=$(jq -c '.mapping.models//{}' "$profile_file")
+  mapping_bounds=$(jq -c '.mapping.bounds//{}' "$profile_file")
+fi
+jq -en --argjson models "$model_map" '$models|type=="object" and ((keys-["opus","fable","sonnet","haiku","subagent","custom"])|length==0) and all(.[];type=="string" and length>0 and length<=512 and (test("[[:cntrl:]]")|not))' >/dev/null || die 'invalid role model mapping'
+context=${CLCD_CONTEXT_TOKENS:-1000000}
+[[ "$context" =~ ^[1-9][0-9]{3,6}$ ]] && [ "$context" -le 2000000 ] || die 'context must be an integer between 1000 and 2000000'
+compact=${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$((context * 3 / 4))}
+[[ "$compact" =~ ^[1-9][0-9]{0,6}$ ]] && [ "$compact" -le "$context" ] || die 'compaction must be a positive integer no greater than context'
+if [ "$mapping_bounds" != '{}' ];then
+  context=$(printf '%s' "$mapping_bounds"|jq -er --argjson context "$context" '[.context_tokens// $context,$context]|min|select(type=="number" and .>=1000 and .==floor)') || die 'invalid mapped context bound'
+  if [ -z "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] || [ "$compact" -gt "$context" ];then compact=$((context * 3 / 4));fi
+  if printf '%s' "$mapping_bounds"|jq -e '.output_tokens!=null' >/dev/null;then
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS=$(printf '%s' "$mapping_bounds"|jq -er --argjson context "$context" --arg output "${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}" '[.output_tokens,($output|if .=="" then 4096 else tonumber end),$context]|min|select(type=="number" and .>0 and .==floor)') || die 'invalid mapped output bound'
+  fi
+fi
+model=${CLCD_MODEL:-gpt-6.1-sol}
+api_key=''
+case "$transport" in
+  codex) endpoint=https://chatgpt.com/backend-api/codex/responses;;
+  openai) endpoint=https://api.openai.com/v1/responses; api_key=${CLCD_API_KEY:-${OPENAI_API_KEY:-}}; key_name=openai-api-key;;
+  grok) endpoint=https://api.x.ai/v1/responses; api_key=${CLCD_API_KEY:-${XAI_API_KEY:-}}; key_name=grok-api-key;;
+  gemini) endpoint=${CLCD_CHAT_URL:-}; api_key=${CLCD_API_KEY:-${GEMINI_API_KEY:-}}; key_name=gemini-api-key;;
+  local) endpoint=${CLCD_CHAT_URL:-}; api_key=${CLCD_API_KEY:-${LOCAL_API_KEY:-}}; key_name=local-api-key;;
+  api|chat) endpoint=${CLCD_API_URL:-${CLCD_CHAT_URL:-}}; api_key=${CLCD_API_KEY:-}; key_name=custom-api-key;;
+esac
+if [ "$transport" != codex ]; then
+  if [ -z "$api_key" ] && [ "$transport" != local ]; then
+    key_path="${XDG_CONFIG_HOME:-$HOME/.config}/claude-driven-ai-providers/$key_name"
+    if [ -f "$key_path" ]; then
+      [ ! -L "$key_path" ] && [ "$(stat -f '%u' "$key_path")" = "$(id -u)" ] && [ "$((8#$(stat -f '%Lp' "$key_path") & 077))" -eq 0 ] || die 'API key file must be private and owned by you'
+      api_key=$(cat "$key_path")
+    fi
+  fi
+  [ "$transport" = local ] || [ -n "$api_key" ] || die 'API key is missing; use clai key set'
+  if [ -n "$api_key" ]; then [[ "$api_key" =~ ^[A-Za-z0-9._~+/:=-]+$ ]] || die 'invalid API key characters'; fi
+  if [ "$transport" = gemini ]; then
+    [ "$endpoint" = https://generativelanguage.googleapis.com/v1beta/openai/chat/completions ] || die 'Gemini endpoint must use the official origin'
+  elif [ "$transport" = api ] || [ "$transport" = chat ]; then
+    jq -en --arg url "$endpoint" '$url|test("^https://[A-Za-z0-9_.-]+(:[0-9]{1,5})?/[^\\s?#]*$")' >/dev/null || die 'API endpoints must use HTTPS without userinfo/query/fragment'
+  elif [ "$transport" = local ]; then
+    jq -en --arg url "$endpoint" '$url|test("^https?://(\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9_.-]+)(:[0-9]{1,5})?/[^\\s?#]*$")' >/dev/null || die 'invalid local chat URL'
+    if [[ "$endpoint" == http://* ]] && [ -n "$api_key" ]; then [[ "$endpoint" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]+)?/ ]] || die 'authenticated HTTP must use numeric loopback'; fi
+  fi
+fi
+chat_mode=false
+case "$transport" in gemini|local|chat) chat_mode=true;; esac
+adapter_dir=${CLCD_ADAPTER_DIR:-$(cd "$(dirname "$0")" && pwd)/adapters}
+chat_cache=${CLCD_CHAT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-driven-ai-providers/$transport}
+if [ "$chat_mode" = true ]; then
+  [ -f "$adapter_dir/chat-request.jq" ] && [ -f "$adapter_dir/chat-stream.jq" ] || die 'chat adapters are missing'
+  mkdir -p "$chat_cache"; chmod 700 "$chat_cache"
+fi
+effort=${CLCD_EFFORT:-medium}
+effort_override=false
+[ -z "${CLCD_EFFORT:-}" ] || effort_override=true
+case "$effort" in low|medium|high|xhigh) ;; *) die 'invalid CLCD_EFFORT';; esac
+case "$transport" in grok|local|chat) [ "$effort_override" = false ] || die 'reasoning effort is unsupported by this route';; esac
+if [ "$transport" = gemini ] && [ "$effort" = xhigh ]; then die 'Gemini effort must be low, medium or high'; fi
+printf '%s' "$mapping_bounds"|jq -e --arg effort "$effort" '.effort_levels==null or (.effort_levels|index($effort)!=null)' >/dev/null || die 'effort is unsupported by the mapped models'
+header_timeout=${CLCD_HEADER_TIMEOUT:-120}
+[[ "$header_timeout" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$header_timeout" -le 600 ] || die 'header timeout must be an integer between 1 and 600 seconds'
+runtime=$(mktemp -d "${TMPDIR:-/tmp}/clcd.XXXXXXXX")
+chmod 700 "$runtime"
+umask 077
+key=$(openssl rand -hex 32)
+port=$((40000 + RANDOM % 20000))
+auth_pid='' server_pid='' claude_pid=''
+
+kill_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
+  kill "$pid" 2>/dev/null || true
+}
+cleanup() {
+  trap - EXIT INT TERM HUP
+  for pid in "$claude_pid" "$server_pid" "$auth_pid"; do
+    [ -z "$pid" ] || kill_tree "$pid"
+  done
+  wait 2>/dev/null || true
+  rm -rf -- "$runtime"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+if [ "$transport" = codex ]; then
+# Codex alone owns the OAuth refresh token and credential store.
+mkfifo "$runtime/auth-in" "$runtime/auth-out"
+exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out"
+(
+  unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN
+  unset CODEX_APP_SERVER_LOGIN_CLIENT_ID CODEX_REFRESH_TOKEN_URL_OVERRIDE CODEX_REVOKE_TOKEN_URL_OVERRIDE
+  exec codex -c 'model_provider="openai"' app-server --listen stdio://
+) <"$runtime/auth-in" >"$runtime/auth-out" 2>/dev/null 5>&- 6>&- &
+auth_pid=$!
+
+else
+  exec 5</dev/null 6</dev/null
+fi
+
+rpc() {
+  local request=$1 line id deadline remaining
+  id=$(openssl rand -hex 12)
+  deadline=$((SECONDS + 30))
+  printf '%s' "$request" | jq -c --arg id "$id" '.id=$id' >&5 || return 1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    remaining=$((deadline - SECONDS))
+    IFS= read -r -t "$remaining" line <&6 || return 1
+    if printf '%s' "$line" | jq -e --arg id "$id" '.id == $id and (has("result") or has("error"))' >/dev/null; then
+      printf '%s' "$line" | jq -ce 'if has("error") then error("Codex RPC failed") else .result end'
+      return
+    fi
+    # Refuse any unexpected server request; authentication never authorizes tools.
+    if printf '%s' "$line" | jq -e 'has("id") and (.method | type == "string")' >/dev/null; then
+      printf '%s' "$line" | jq -c '{id, error:{code:-32601,message:"Not supported"}}' >&5
+    fi
+  done
+  return 1
+}
+if [ "$transport" = codex ]; then
+rpc '{"method":"initialize","params":{"clientInfo":{"name":"clcd","version":"1"},"capabilities":{}}}' >/dev/null || die 'could not initialize Codex app-server'
+printf '%s\n' '{"method":"initialized"}' >&5
+fi
+
+auth() (
+  trap - EXIT INT TERM HUP
+  local refresh=${1:-false} status exp now
+  if [ "$transport" != codex ]; then printf '%s' "$api_key" | jq -Rs '{token:.,account:""}'; return; fi
+  # The kernel releases this descriptor lock even if the handler is killed.
+  lockf -s -t 30 9 || return 1
+  status=$(rpc "{\"method\":\"getAuthStatus\",\"params\":{\"includeToken\":true,\"refreshToken\":$refresh}}") || return 1
+  if ! printf '%s' "$status" | jq -e '.authMethod == "chatgpt" and .requiresOpenaiAuth != false and (.authToken | type == "string" and length > 0)' >/dev/null; then
+    return 1
+  fi
+  exp=$(printf '%s' "$status" | jq -r 'try (.authToken | split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | .exp // 0) catch 0')
+  now=$(date +%s)
+  if [ "$refresh" = false ] && [[ "$exp" =~ ^[0-9]+$ ]] && [ "$exp" -gt 0 ] && [ "$exp" -lt "$((now + 600))" ]; then
+    status=$(rpc '{"method":"getAuthStatus","params":{"includeToken":true,"refreshToken":true}}') || return 1
+  fi
+  printf '%s' "$status" | jq -ce 'select(.authMethod == "chatgpt" and .requiresOpenaiAuth != false) |
+    {token:.authToken, account:(.authToken | split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | .["https://api.openai.com/auth"].chatgpt_account_id)} |
+    select((.token | type == "string" and length > 0) and (.account | type == "string" and test("^[A-Za-z0-9_.-]{1,256}$")))'
+) 9>"$runtime/auth-lock"
+auth >/dev/null || die 'ChatGPT authentication is unavailable; run codex login, then retry'
+
+cat >"$runtime/request.jq" <<'JQ'
+def wire($name): ($names[0][$name] // $name);
+def selected_model:
+  .model as $requested | ($ARGS.named.mapping//{}) as $map |
+  if $requested==null then $model
+  elif ([$map[]]|index($requested))!=null then $requested
+  elif ($requested|IN("opus","fable","sonnet","haiku","subagent")) then $map[$requested]//$model
+  elif $requested=="default" then $model
+  elif ($requested|startswith("claude-")) then
+    ([$requested|capture("(^|-)(?<role>opus|fable|sonnet|haiku)(-|$)")][0].role) as $role | if $role==null then $model else $map[$role]//$model end
+  else $requested end;
+def parts($role):
+  if type == "string" then [{type:(if $role == "assistant" then "output_text" else "input_text" end),text:.}]
+  else map(
+    if .type == "text" then {type:(if $role == "assistant" then "output_text" else "input_text" end),text:.text}
+    elif .type == "image" and $role == "user" then
+      {type:"input_image",image_url:(if .source.type == "base64" then "data:"+.source.media_type+";base64,"+.source.data elif .source.type == "url" then .source.url else error("Unsupported image source") end)}
+    else error("Unsupported content block: "+(.type // "unknown")) end)
+  end;
+def message($role;$content): {type:"message",role:$role,content:($content | parts($role))};
+def inputs:
+  .messages | map((if .role=="system" then "developer" else .role end) as $role |
+    if (.content | type) == "string" then [message($role;.content)]
+    else reduce .content[] as $b ([];
+      if $b.type == "tool_use" then . + [{type:"function_call",call_id:$b.id,name:wire($b.name),arguments:($b.input|tojson)}]
+      elif $b.type == "tool_result" then
+        . + [{type:"function_call_output",call_id:$b.tool_use_id,output:((if $b.is_error then "[Tool error]\n" else "" end) + (if ($b.content|type)=="string" then $b.content else [($b.content // [])[] | if .type=="text" then .text elif .type=="image" then empty else error("Unsupported tool result block") end] | join("\n") end))}] +
+          (if ($b.content|type)=="array" then [$b.content[] | select(.type=="image") | message("user";[.])] else [] end)
+      elif $b.type == "thinking" or $b.type == "redacted_thinking" then .
+      else . + [message($role;[$b])] end)
+    end) | add // [];
+. as $original |
+.output_config.effort as $requested_effort |
+if .temperature!=null or .top_p!=null or .top_k!=null or ((.stop_sequences // [])|length)>0 then
+  error("Sampling parameters and stop_sequences are unsupported by this Codex bridge")
+elif .output_config.format!=null or .output_format!=null then
+  error("Structured output format controls are unsupported by this Codex bridge")
+elif .thinking.type=="enabled" then
+  error("Fixed thinking budgets are unsupported; use adaptive thinking or CLCD_EFFORT")
+elif ($ARGS.named.transport|IN("grok","local","chat")) and $requested_effort!=null then
+  error("Reasoning effort is unsupported by this route")
+elif $ARGS.named.effort_override!="true" and $requested_effort!=null and (["low","medium","high","xhigh"]|index($requested_effort)|not) then
+  error("Unsupported reasoning effort; supported levels: low, medium, high, xhigh")
+else . end |
+{
+  model:selected_model,
+  instructions:(if (.system|type)=="string" then .system else [(.system // [])[] | .text // ""] | join("\n") end),
+  input:inputs, store:false, stream:true,
+  reasoning:{effort:(if $ARGS.named.effort_override=="true" then $effort else .output_config.effort // $effort end)}, parallel_tool_calls:(.tool_choice.disable_parallel_tool_use != true),
+  tools:[(.tools // [])[] | if (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end]
+} + (if .tool_choice.type == "any" then {tool_choice:"required"}
+     elif .tool_choice.type == "none" then {tool_choice:"none"}
+     elif .tool_choice.type == "tool" then {tool_choice:{type:"function",name:wire(.tool_choice.name)}} else {} end) |
+if $ARGS.named.transport!=null and $ARGS.named.transport!="codex" then
+  .+{max_output_tokens:($original.max_tokens // 4096)} |
+  if $ARGS.named.transport=="grok" then del(.reasoning) else . end
+else . end
+JQ
+
+cat >"$runtime/stream.jq" <<'JQ'
+def event($type;$body): {type:$type} + $body;
+def emit: .events[] | "event: \(.type)\ndata: \(tojson)\n\n";
+def start($key;$block):
+  .blocks[$key]={index:.next,open:true} | .next+=1 |
+  .events += [event("content_block_start";{index:.blocks[$key].index,content_block:$block})];
+def stop($key):
+  if .blocks[$key].open then .blocks[$key].open=false |
+    .events += [event("content_block_stop";{index:.blocks[$key].index})] else . end;
+foreach (inputs, "__clcd_eof__") as $rawline
+  ({blocks:{},next:0,tool:false,ended:false,events:[]};
+   ($rawline|rtrimstr("\r")) as $line | .events=[] |
+   if $line=="__clcd_eof__" then
+     if .ended then . else error("Codex stream ended before completion") end
+   elif ($line|startswith("data: ")) and $line!="data: [DONE]" then
+     ($line[6:] | fromjson) as $e |
+     ($e.item_id // $e.item.id // "") as $id |
+     if $e.type=="response.created" then
+       .events=[event("message_start";{message:{id:($e.response.id // "msg_clcd"),type:"message",role:"assistant",model:$model,content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:0,output_tokens:0,cache_creation_input_tokens:0,cache_read_input_tokens:0}}})]
+     elif $e.type=="response.output_item.added" and $e.item.type=="function_call" then
+       .tool=true | start($id;{type:"tool_use",id:$e.item.call_id,name:($names[0][$e.item.name] // $e.item.name),input:{}})
+     elif $e.type=="response.content_part.added" and ($e.part.type|IN("output_text","refusal")) then
+       start($id+":"+($e.content_index|tostring);{type:"text",text:""})
+     elif $e.type=="response.output_text.delta" or $e.type=="response.refusal.delta" then
+       ($id+":"+($e.content_index|tostring)) as $k |
+       (if .blocks[$k]==null then start($k;{type:"text",text:""}) else . end) |
+       .events += [event("content_block_delta";{index:.blocks[$k].index,delta:{type:"text_delta",text:$e.delta}})]
+     elif $e.type=="response.function_call_arguments.delta" then
+       .blocks[$id].arguments=true |
+       .events += [event("content_block_delta";{index:.blocks[$id].index,delta:{type:"input_json_delta",partial_json:$e.delta}})]
+     elif $e.type=="response.output_item.done" and $e.item.type=="function_call" then
+       (if .blocks[$id].arguments then . else .events += [event("content_block_delta";{index:.blocks[$id].index,delta:{type:"input_json_delta",partial_json:($e.item.arguments // "{}")}})] end) | stop($id)
+     elif $e.type=="response.content_part.done" and ($e.part.type|IN("output_text","refusal")) then stop($id+":"+($e.content_index|tostring))
+     elif $e.type=="response.completed" or $e.type=="response.incomplete" then
+       reduce (.blocks|keys[]) as $k (.;stop($k)) |
+       .ended=true | ($e.response.usage // {}) as $u |
+       .events += [event("message_delta";{delta:{stop_reason:(if $e.type=="response.incomplete" then "max_tokens" elif .tool then "tool_use" else "end_turn" end),stop_sequence:null},usage:{input_tokens:(($u.input_tokens // 0)-($u.input_tokens_details.cached_tokens // 0)),cache_read_input_tokens:($u.input_tokens_details.cached_tokens // 0),output_tokens:($u.output_tokens // 0)}}),event("message_stop";{})]
+     elif $e.type=="response.failed" or $e.type=="error" then
+       .ended=true | .events=[event("error";{error:{type:"api_error",message:"Codex returned an error."}})]
+     else . end
+   else . end;
+   emit)
+JQ
+
+cache_name() {
+  printf '%s\n%s' "$1" "$2" | openssl dgst -sha256 | awk '{print $NF}'
+}
+prepare_chat() {
+  local conn=$1 call_id file entry chosen
+  chosen=$(jq -r .model "$conn/request")
+  printf '{}\n' >"$conn/metadata"
+  if [ "$transport" = gemini ]; then
+    while IFS= read -r call_id; do
+      file="$chat_cache/$(cache_name "$chosen" "$call_id").json"
+      [ -f "$file" ] && [ ! -L "$file" ] || return 1
+      [ "$(stat -f '%u' "$file")" = "$(id -u)" ] && [ "$((8#$(stat -f '%Lp' "$file") & 077))" -eq 0 ] || return 1
+      entry=$(jq -ce --arg id "$call_id" --arg model "$chosen" 'select(.id==$id and .model==$model)' "$file") || return 1
+      printf '%s' "$entry" | jq -s --slurpfile prior "$conn/metadata" '$prior[0]+{(.[0].id):.[0]}' >"$conn/metadata-next"
+      mv "$conn/metadata-next" "$conn/metadata"
+    done < <(jq -r '.input[]|select(.type=="function_call")|.call_id' "$conn/request")
+  fi
+  jq --arg provider "$transport" --slurpfile metadata "$conn/metadata" -f "$adapter_dir/chat-request.jq" "$conn/request" >"$conn/chat-request" || return 1
+  mv "$conn/chat-request" "$conn/request"
+}
+normalize_chat() (
+  trap - EXIT
+  local conn=$1 chosen=$2 line entry call_id file stage
+  jq --unbuffered -Rnj --arg model "$chosen" -f "$adapter_dir/chat-stream.jq" <&8 2>"$conn/chat-error" |
+  while IFS= read -r line; do
+    case "$line" in
+      'cache: '*)
+        entry=${line#cache: }
+        call_id=$(printf '%s' "$entry"|jq -er .id) || return 1
+        file="$chat_cache/$(cache_name "$chosen" "$call_id").json"
+        stage=$(mktemp "$chat_cache/.metadata.XXXXXXXX")
+        printf '%s\n' "$entry" >"$stage"; chmod 600 "$stage"; mv -f "$stage" "$file";;
+      *) printf '%s\n' "$line" 2>/dev/null || return 1;;
+    esac
+  done
+)
+
+read_stream() (
+  trap - EXIT
+  if [ "$chat_mode" = true ]; then normalize_chat "$1" "$2"; else cat <&8; fi
+)
+stop_upstream() {
+  exec 8<&-
+  if [ -n "${upstream_pid:-}" ]; then
+    kill_tree "$upstream_pid"
+    wait "$upstream_pid" 2>/dev/null || true
+    upstream_pid=''
+  fi
+}
+open_upstream() {
+  local conn=$1 status token account attempt deadline allowed_protocols='=https'
+  [ "$transport" != local ] || allowed_protocols='=https,http'
+  upstream_status=502
+  mkfifo "$conn/body"
+  for attempt in false true; do
+    status=$(auth "$attempt") || {
+      upstream_status=503
+      printf '{"error":{"message":"Codex authentication unavailable; retry or restart clcd if Codex exited."}}' >"$conn/upstream-error"
+      return 1
+    }
+    token=$(printf '%s' "$status" | jq -r .token)
+    account=$(printf '%s' "$status" | jq -r .account)
+    : >"$conn/headers"
+    (
+      trap - EXIT INT TERM HUP
+      # Credentials go to curl through a pipe, never argv or a credential file.
+      {
+        [ -z "$token" ] || printf 'header = "Authorization: Bearer %s"\n' "$token"
+        if [ "$transport" = codex ]; then printf 'header = "ChatGPT-Account-Id: %s"\nheader = "OpenAI-Beta: responses=experimental"\nheader = "originator: codex_cli_rs"\n' "$account"; fi
+      } 2>/dev/null |
+      curl --config - --silent --show-error --no-buffer --connect-timeout 20 --max-time 600 \
+        --suppress-connect-headers \
+        --proto "$allowed_protocols" --max-redirs 0 -H 'Content-Type: application/json' -H 'Accept: text/event-stream' \
+        --dump-header "$conn/headers" --data-binary "@$conn/request" \
+        "$endpoint"
+    ) >"$conn/body" 2>"$conn/curl-error" &
+    upstream_pid=$!
+    exec 8<"$conn/body"
+    deadline=$((SECONDS + header_timeout))
+    status=''
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      status=$(awk '/^HTTP\// {s=$2; complete=0} /^\r?$/ {complete=1} END {if (complete && s>=200) print s}' "$conn/headers")
+      [ -z "$status" ] || break
+      kill -0 "$upstream_pid" 2>/dev/null || break
+      sleep 0.02
+    done
+    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then upstream_status=$status; return 0; fi
+    if [ "$transport" = codex ] && [ "$status" = 401 ] && [ "$attempt" = false ]; then stop_upstream; continue; fi
+    if [[ "$status" =~ ^[45][0-9][0-9]$ ]]; then
+      upstream_status=$status
+      head -c 65536 <&8 >"$conn/upstream-error" || true
+    else
+      upstream_status=502
+      printf '{"error":{"message":"Codex connection failed, redirected, or timed out before response headers."}}' >"$conn/upstream-error"
+    fi
+    stop_upstream
+    return 1
+  done
+}
+
+http_json() {
+  local code=$1 body=$2 retry_after=${3:-}
+  {
+    printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n' "$code" "${#body}" || return 1
+    [ -z "$retry_after" ] || printf 'Retry-After: %s\r\n' "$retry_after" || return 1
+    printf '\r\n%s' "$body"
+  } 2>/dev/null
+}
+http_error() {
+  http_json "$1" "$(jq -cn --arg message "$2" '{type:"error",error:{type:"invalid_request_error",message:$message}}')"
+}
+upstream_error() {
+  local conn=$1 body retry_after raw
+  raw=$(cat "$conn/upstream-error")
+  [ -z "$api_key" ] || raw=${raw//"$api_key"/<redacted>}
+  body=$(printf '%s' "$raw" | jq -Rsc --arg status "$upstream_status" '
+    (try fromjson catch {}) as $e |
+    (($e.error.message // $e.detail // $e.message // "Codex upstream request failed") | if type=="string" then . else tojson end |
+      gsub("eyJ[A-Za-z0-9_.-]+|sk-[A-Za-z0-9_*.-]+|xai-[A-Za-z0-9_*.-]+|AIza[A-Za-z0-9_*.-]+";"<redacted>") | .[0:500]) as $message |
+    {type:"error",error:{type:(if $status=="429" then "rate_limit_error" elif $status=="401" or $status=="403" then "authentication_error" elif ($status|startswith("4")) then "invalid_request_error" else "api_error" end),
+      message:(if ($message|test("context.{0,20}(length|window|limit)|too many tokens|prompt is too long";"i")) then "prompt is too long: "+$message else $message end)}}')
+  retry_after=$(awk 'tolower($0) ~ /^retry-after:/ {sub(/^[^:]*:[ ]*/,"");sub(/\r$/,"");v=$0} END{print v}' "$conn/headers" 2>/dev/null || true)
+  [[ "$retry_after" =~ ^[A-Za-z0-9,:\ -]*$ ]] || retry_after=''
+  http_json "$upstream_status Codex" "$body" "$retry_after"
+}
+chunks() {
+  trap - EXIT
+  local line
+  while IFS= read -r line; do
+    printf '%x\r\n%s\n\r\n' "$((${#line} + 1))" "$line" 2>/dev/null || {
+      [ -z "${upstream_pid:-}" ] || stop_upstream
+      return 1
+    }
+  done
+}
+stream_problem() {
+  if [ "$chat_mode" != true ]; then printf 'Upstream response stream was interrupted.'
+  elif grep -q 'before a finish reason' "$1/chat-error"; then printf 'Chat stream ended before a finish reason.'
+  elif grep -q 'content filtering' "$1/chat-error"; then printf 'Chat response was blocked by content filtering.'
+  elif grep -q 'Incomplete chat tool call' "$1/chat-error"; then printf 'Chat stream contained an incomplete tool call.'
+  else printf 'Chat response stream was malformed or interrupted.'; fi
+}
+
+handle() {
+  local conn=$1 first method path _version header name value length=0 supplied='' body='' stream selected problem curl_code
+  local results
+  IFS= read -r first || return
+  read -r method path _version <<<"$first"
+  path=${path%%\?*}
+  while IFS= read -r -t 30 header; do
+    header=${header%$'\r'}; [ -n "$header" ] || break
+    name=${header%%:*}; value=${header#*:}; value=${value# }
+    case "$name" in
+      [Cc]ontent-[Ll]ength) length=$value;;
+      [Aa]uthorization) supplied=${value#Bearer };;
+      [Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]) supplied=$value;;
+      [Tt]ransfer-[Ee]ncoding) http_error '400 Bad Request' 'Chunked requests are unsupported'; return;;
+    esac
+  done
+  if [ "$supplied" != "$key" ]; then http_error '401 Unauthorized' 'Local proxy authentication required'; return; fi
+  if [ "$method" = GET ] && [ "$path" = /health ]; then http_json '200 OK' '{"status":"clcd"}'; return; fi
+  if ! [[ "$length" =~ ^[0-9]+$ ]] || [ "${#length}" -gt 8 ] || [ "$length" -gt 33554432 ]; then http_error '413 Payload Too Large' 'Invalid request length'; return; fi
+  if [ "$length" -gt 0 ]; then IFS= read -r -d '' -n "$length" -t 60 body || { http_error '400 Bad Request' 'Incomplete request'; return; }; fi
+  if [ "$method" != POST ]; then http_error '404 Not Found' 'Unknown endpoint'; return; fi
+  if [ "$path" = /v1/messages/count_tokens ]; then
+    # No subscription tokenization endpoint: this estimate is for context sizing only.
+    http_json '200 OK' "$(printf '%s' "$body" | jq -c '{input_tokens:([.system,.messages,.tools]|tojson|length/3|ceil)}')"; return
+  fi
+  if [ "$path" != /v1/messages ]; then http_error '404 Not Found' 'Unknown endpoint'; return; fi
+  printf '%s' "$body" >"$conn/input"
+  if ! jq -e '.messages|type=="array"' "$conn/input" >/dev/null 2>&1; then http_error '400 Bad Request' 'Expected a messages array'; return; fi
+  jq '[(.tools // []) | to_entries[] | {key:.value.name,value:(if (.value.name|test("^[A-Za-z0-9_-]{1,64}$") and (startswith("clcd_tool_")|not)) then .value.name else "clcd_tool_"+(.key|tostring) end)}] | from_entries' "$conn/input" >"$conn/names"
+  jq 'to_entries | map({key:.value,value:.key}) | from_entries' "$conn/names" >"$conn/reverse"
+  if ! jq --arg model "$model" --argjson mapping "$model_map" --arg effort "$effort" --arg effort_override "$effort_override" --arg transport "$transport" --slurpfile names "$conn/names" -f "$runtime/request.jq" "$conn/input" >"$conn/request" 2>"$conn/translation-error"; then
+    problem=$(sed -n 's/^jq: error.*): //p' "$conn/translation-error" | head -c 300)
+    http_error '400 Bad Request' "${problem:-Unsupported Messages content or tool}"; return
+  fi
+  selected=$(jq -r .model "$conn/request")
+  if [ "$chat_mode" = true ] && ! prepare_chat "$conn"; then
+    http_error '400 Bad Request' 'Chat request is unsupported or Gemini replay metadata is missing/corrupt; start a new conversation or retain its private cache'; return
+  fi
+  stream=$(jq -r '.stream // false' "$conn/input")
+  if ! open_upstream "$conn"; then upstream_error "$conn"; return; fi
+  if [ "$stream" = true ]; then
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n' 2>/dev/null || { stop_upstream; return; }
+    if read_stream "$conn" "$selected" | jq --unbuffered -Rnj --arg model "$selected" --slurpfile names "$conn/reverse" -f "$runtime/stream.jq" 2>"$conn/stream-error" | chunks; then
+      results=("${PIPESTATUS[@]}")
+    else
+      results=("${PIPESTATUS[@]}")
+    fi
+    exec 8<&-
+    if [ "${results[2]}" -ne 0 ]; then stop_upstream; return; fi
+    curl_code=0
+    wait "$upstream_pid" || curl_code=$?
+    upstream_pid=''
+    if [ "${results[0]}" -ne 0 ] || [ "${results[1]}" -ne 0 ] || [ "$curl_code" -ne 0 ]; then
+      printf 'event: error\ndata: %s\n\n' "$(jq -cn --arg message "$(stream_problem "$conn")" '{type:"error",error:{type:"api_error",message:$message}}')" | chunks || return
+    fi
+    printf '0\r\n\r\n' 2>/dev/null
+  else
+    if ! read_stream "$conn" "$selected" >"$conn/stream"; then stop_upstream; http_error '502 Bad Gateway' "$(stream_problem "$conn")"; return; fi
+    exec 8<&-
+    curl_code=0
+    wait "$upstream_pid" || curl_code=$?
+    upstream_pid=''
+    if [ "$curl_code" -ne 0 ]; then http_error '502 Bad Gateway' 'Codex response stream was interrupted'; return; fi
+    if ! jq -Rsc --arg model "$selected" --slurpfile names "$conn/reverse" '
+      [split("\n")[] | select(startswith("data: ")) | .[6:] | select(.!="[DONE]") | fromjson | select(.type=="response.completed" or .type=="response.incomplete")][-1].response |
+      if .==null then error("Incomplete Codex stream") else . end |
+      {id:.id,type:"message",role:"assistant",model:$model,stop_sequence:null,
+       stop_reason:(if .status=="incomplete" then "max_tokens" elif any(.output[]; .type=="function_call") then "tool_use" else "end_turn" end),
+       content:[.output[] | if .type=="message" then .content[] | select(.type|IN("output_text","refusal")) | {type:"text",text:(.text//.refusal)}
+         elif .type=="function_call" then {type:"tool_use",id:.call_id,name:($names[0][.name] // .name),input:(.arguments|fromjson)} else empty end],
+       usage:{input_tokens:((.usage.input_tokens // 0)-(.usage.input_tokens_details.cached_tokens // 0)),cache_read_input_tokens:(.usage.input_tokens_details.cached_tokens // 0),cache_creation_input_tokens:0,output_tokens:(.usage.output_tokens // 0)}}' "$conn/stream" >"$conn/answer"; then
+      http_error '502 Bad Gateway' 'Incomplete Codex response'; return
+    fi
+    http_json '200 OK' "$(cat "$conn/answer")"
+  fi
+}
+
+clcd_handler() {
+  set -euo pipefail
+  local conn upstream_pid='' upstream_status=502
+  conn=$(mktemp -d "$runtime/request.XXXXXXXX")
+  trap 'stop_upstream; rm -rf -- "$conn"' EXIT
+  if [ "$transport" = codex ]; then exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out"; fi
+  handle "$conn" || true
+  rm -rf -- "$conn"
+  trap - EXIT
+}
+export runtime key model effort effort_override transport endpoint api_key chat_mode adapter_dir chat_cache header_timeout model_map
+export -f clcd_handler handle open_upstream stop_upstream upstream_error kill_tree rpc auth http_json http_error chunks cache_name prepare_chat normalize_chat read_stream stream_problem
+socat -d0 "TCP4-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" 'EXEC:/bin/bash -c clcd_handler' 5>&- 6>&- 2>"$runtime/socket-errors" &
+server_pid=$!
+export -n runtime key model effort effort_override transport endpoint api_key chat_mode adapter_dir chat_cache header_timeout model_map
+export -n -f clcd_handler handle open_upstream stop_upstream upstream_error kill_tree rpc auth http_json http_error chunks cache_name prepare_chat normalize_chat read_stream stream_problem
+base="http://127.0.0.1:$port"
+ready=false
+for _ in {1..40}; do
+  if result=$(printf 'header = "x-api-key: %s"\n' "$key" | curl --config - --silent --fail --max-time 1 "$base/health") && [ "$result" = '{"status":"clcd"}' ]; then ready=true; break; fi
+  sleep 0.1
+done
+[ "$ready" = true ] || die 'could not start the local bridge'
+
+if [ "${1:-}" = --check ]; then
+  printf 'clcd: checking %s through the selected provider...\n' "$model" >&2
+  result=$(printf 'header = "x-api-key: %s"\n' "$key" |
+    curl --config - --silent --show-error --fail --max-time 120 -H 'Content-Type: application/json' \
+      --data "$(jq -cn --arg model "$model" '{model:$model,max_tokens:1024,messages:[{role:"user",content:"Reply with exactly CLCD_OK"}]}')" "$base/v1/messages") || die 'provider check failed'
+  printf '%s' "$result" | jq -er '[.content[] | select(.type=="text") | .text] | join("") | select(.=="CLCD_OK")' || die 'unexpected provider check response'
+  exit
+fi
+
+export CLAUDE_CONFIG_DIR="${CLCD_PROFILE:-$HOME/.claude-codex}"
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS
+unset CLAUDE_CODE_EFFORT_LEVEL
+export ANTHROPIC_BASE_URL="$base" ANTHROPIC_AUTH_TOKEN="$key"
+export ANTHROPIC_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model" ANTHROPIC_DEFAULT_FABLE_MODEL="$model"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
+for mapping_role in opus fable sonnet haiku subagent custom;do
+  case "$mapping_role" in subagent) mapping_var=CLAUDE_CODE_SUBAGENT_MODEL;;custom) mapping_var=ANTHROPIC_CUSTOM_MODEL_OPTION;;*) mapping_var="ANTHROPIC_DEFAULT_$(printf '%s' "$mapping_role"|tr '[:lower:]' '[:upper:]')_MODEL";;esac
+  mapping_model=$(printf '%s' "$model_map"|jq -r --arg role "$mapping_role" --arg model "$model" '.[$role]//$model')
+  export "$mapping_var=$mapping_model"
+done
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_PROMPT_CACHING=1 ENABLE_TOOL_SEARCH=false
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$context"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact"
+if [ -n "${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}" ]; then export CLAUDE_CODE_MAX_OUTPUT_TOKENS; else unset CLAUDE_CODE_MAX_OUTPUT_TOKENS; fi
+unset CLCD_API_KEY OPENAI_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY LOCAL_API_KEY OLLAMA_API_KEY LM_API_TOKEN DEEPSEEK_API_KEY MINIMAX_API_KEY ZAI_API_KEY MOONSHOT_API_KEY KIMI_API_KEY
+unset CLCD_CONFIG_RESOLVED CLCD_MODEL_MAP
+umask "$caller_umask"
+if [ "$caller_lc_all_set" = x ]; then export LC_ALL="$caller_lc_all"; else unset LC_ALL; fi
+claude --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &
+claude_pid=$!
+set +e
+wait "$claude_pid"
+code=$?
+claude_pid=
+exit "$code"
