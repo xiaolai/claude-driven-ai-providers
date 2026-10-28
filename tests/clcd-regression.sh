@@ -79,6 +79,10 @@ case "$CLCD_TEST_MODE" in
 esac
 MOCK
 chmod 700 hardening-bin/*
+mv hardening-bin/claude "hardening-bin/Claude Code"
+export CLAI_CLAUDE_BIN="$PWD/hardening-bin/Claude Code"
+printf '#!/bin/bash\nexit 99\n' >hardening-bin/claude
+chmod 700 hardening-bin/claude
 export CLCD_MODEL=legacy-codex CLAI_CODEX_MODEL=ignored CLCD_CONTEXT_TOKENS=900001 CLAI_CODEX_CONTEXT=500000
 unset CLAUDE_CODE_AUTO_COMPACT_WINDOW
 for mode in quota context refresh disconnect; do

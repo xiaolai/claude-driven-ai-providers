@@ -54,4 +54,7 @@ env -u CLDLS_BASE_URL -u CLLDS_BASE_URL -u CLDLS_MODEL -u CLLDS_MODEL -u CLDLS_C
 export EXPECTED_URL=http://127.0.0.1:8332 EXPECTED_MODEL=cyberneurova-low EXPECTED_CONTEXT=65536
 CLLDS_BASE_URL="$EXPECTED_URL" CLLDS_MODEL="$EXPECTED_MODEL" CLLDS_CONTEXT_TOKENS="$EXPECTED_CONTEXT" "$repo/cldls" --print "$EXPECTED_PROMPT"
 CLDLS_BASE_URL="$EXPECTED_URL" CLLDS_BASE_URL=http://127.0.0.1:8333 CLDLS_MODEL="$EXPECTED_MODEL" CLLDS_MODEL=cyberneurova-high CLDLS_CONTEXT_TOKENS="$EXPECTED_CONTEXT" CLLDS_CONTEXT_TOKENS=16384 "$repo/cldls" --print "$EXPECTED_PROMPT"
+mv "$test_dir/bin/claude" "$test_dir/bin/Claude Code"
+export CLAI_CLAUDE_BIN="$test_dir/bin/Claude Code"
+CLDLS_BASE_URL="$EXPECTED_URL" CLDLS_MODEL="$EXPECTED_MODEL" CLDLS_CONTEXT_TOKENS="$EXPECTED_CONTEXT" "$repo/cldls" --print "$EXPECTED_PROMPT"
 printf 'PASS: launcher syntax, ShellCheck, private data loading, provider/profile/argument preservation, new and legacy local-provider overrides\n'

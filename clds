@@ -8,6 +8,18 @@ if [ "${CLAI_STANDALONE:-0}" != 1 ] && [ -x "$managed_root/clai" ] && [ -f "$man
   exec "$managed_root/clai" run deepseek -- "$@"
 fi
 
+resolve_claude() {
+  local path
+  if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then
+    path=$CLAI_CLAUDE_BIN
+    case "$path" in /*) ;; *) printf 'CLAI_CLAUDE_BIN must be an absolute executable path\n' >&2; return 127;; esac
+  else
+    path=$(type -P claude) || { printf 'claude is not on PATH\n' >&2; return 127; }
+  fi
+  [ -f "$path" ] && [ -x "$path" ] || { printf 'Claude executable is missing or not executable: %s\n' "$path" >&2; return 127; }
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd)" "${path##*/}"
+}
+
 # Refresh model aliases from DeepSeek's official documentation, then exit.
 if [[ "${1:-}" == '--update-models' ]]; then
   if [[ $# -ne 1 ]]; then
@@ -121,9 +133,11 @@ except Exception as error:
 PYUPDATE
 fi
 
+claude_bin=$(resolve_claude)
+
 if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
   printf 'Usage: clds [Claude Code arguments]\n       clds --update-models\n\nUses a separate DeepSeek profile with permission checks bypassed.\n\n'
-  exec claude --help
+  exec "$claude_bin" --help
 fi
 
 
@@ -137,11 +151,6 @@ fi
 if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   printf 'clds: set DEEPSEEK_API_KEY or configure the private deepseek-api-key file.\n' >&2
   exit 1
-fi
-
-if ! command -v claude >/dev/null 2>&1; then
-  printf 'clds: claude is not on PATH. Install Claude Code first.\n' >&2
-  exit 127
 fi
 
 export CLAUDE_CONFIG_DIR="$HOME/.claude-deepseek"
@@ -160,4 +169,4 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-flash[1m]'
 export CLAUDE_CODE_SUBAGENT_MODEL='deepseek-flash[1m]'
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW='786432'
 
-exec claude --dangerously-skip-permissions "$@"
+exec "$claude_bin" --dangerously-skip-permissions "$@"

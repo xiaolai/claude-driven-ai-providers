@@ -39,6 +39,18 @@ command -v jq >/dev/null || fail 'jq is required'
 [ -f "$registry" ] || fail 'providers.json is missing; install the complete runtime'
 jq -e '.schema_version==1 and (.providers|type=="array")' "$registry" >/dev/null || fail 'invalid provider registry'
 
+resolve_claude() {
+  local path
+  if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then
+    path=$CLAI_CLAUDE_BIN
+    case "$path" in /*) ;; *) printf 'CLAI_CLAUDE_BIN must be an absolute executable path\n' >&2; return 127;; esac
+  else
+    path=$(type -P claude) || { printf 'claude is not on PATH\n' >&2; return 127; }
+  fi
+  [ -f "$path" ] && [ -x "$path" ] || { printf 'Claude executable is missing or not executable: %s\n' "$path" >&2; return 127; }
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd)" "${path##*/}"
+}
+
 private_file() {
   local path=$1 mode owner
   [ ! -L "$path" ] && [ -f "$path" ] || fail 'private configuration must be a regular file, not a symlink'
@@ -159,12 +171,24 @@ models_url() {
   fi
 }
 doctor() {
-  local tmp status state missing='' tool auth_type protocol
+  local tmp status state missing='' tool auth_type protocol claude_bin='' resolved='' link version='' candidates hops=0
   read_key
   auth_type=$(printf '%s' "$cfg"|jq -r .auth); protocol=$(printf '%s' "$cfg"|jq -r .protocol)
-  for tool in claude curl jq; do command -v "$tool" >/dev/null || missing="$missing $tool"; done
+  for tool in curl jq; do command -v "$tool" >/dev/null || missing="$missing $tool"; done
   if [ "$protocol" != anthropic ]; then for tool in socat openssl; do command -v "$tool" >/dev/null || missing="$missing $tool"; done; fi
   if [ "$auth_type" = subscription ]; then for tool in codex lockf; do command -v "$tool" >/dev/null || missing="$missing $tool"; done; fi
+  claude_bin=$(resolve_claude) || missing="$missing claude"
+  candidates=$({ type -a -p claude || true; } | jq -Rsc 'split("\n")|map(select(length>0))|unique')
+  if [ -n "$claude_bin" ]; then
+    resolved=$claude_bin
+    while [ -L "$resolved" ] && [ "$hops" -lt 40 ]; do
+      link=$(readlink "$resolved") || break
+      case "$link" in /*) resolved=$link;; *) resolved="${resolved%/*}/$link";; esac
+      hops=$((hops+1))
+    done
+    resolved="$(cd "$(dirname "$resolved")" && pwd)/${resolved##*/}"
+    version=$("$claude_bin" --version 2>/dev/null) || version=''
+  fi
   state=configured
   [ -z "$missing" ] || state="missing-tools"
   if [ "$auth_type" = api ] && [ -z "$credential" ]; then state="missing-key"; fi
@@ -185,7 +209,13 @@ doctor() {
       fi
     fi
   fi
-  jq -cn --arg provider "$id" --arg state "$state" --arg source "$key_source" --arg tools "$missing" '{provider:$provider,state:$state,credential_source:$source,missing_tools:$tools}'
+  jq -cn --arg provider "$id" --arg state "$state" --arg source "$key_source" --arg tools "$missing" \
+    --arg executable "$claude_bin" --arg target "$resolved" --arg version "$version" --argjson candidates "$candidates" \
+    --arg selection "$(if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then printf override; else printf PATH; fi)" \
+    '{provider:$provider,state:$state,credential_source:$source,missing_tools:$tools,
+      claude:{executable:(($executable|select(length>0))//null),resolved_target:(($target|select(length>0))//null),
+        version:(($version|select(length>0))//null),selection:$selection,path_candidates:$candidates},
+      warnings:[if ($candidates|length)>1 then "Multiple Claude installations on PATH; check claude.executable" else empty end]}'
   case "$state" in configured|reachable-not-generation-tested|signed-in-not-generation-tested|no-model-discovery-route) return 0;; *) return 1;; esac
 }
 scrub_provider_keys() {
@@ -195,7 +225,9 @@ scrub_provider_keys() {
   done < <(jq -r '.providers[]|.key_env,.alt_env//empty' "$registry")
 }
 run_provider() {
-  if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage; printf 'Provider: %s\n' "$id"; umask "$caller_umask"; exec claude --help; fi
+  local claude_bin
+  claude_bin=$(resolve_claude) || return $?
+  if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage; printf 'Provider: %s\n' "$id"; umask "$caller_umask"; exec "$claude_bin" --help; fi
   local protocol auth_type selected base context compact effort profile output bridge_transport
   read_key
   protocol=$(printf '%s' "$cfg"|jq -r .protocol); auth_type=$(printf '%s' "$cfg"|jq -r .auth)
@@ -266,7 +298,7 @@ run_provider() {
   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ENABLE_TOOL_SEARCH=false
   scrub_provider_keys
   umask "$caller_umask"
-  exec claude --dangerously-skip-permissions "$@"
+  exec "$claude_bin" --dangerously-skip-permissions "$@"
 }
 install_runtime() {
   local bin=${1:-$HOME/.local/bin} data stage release alias target qtarget

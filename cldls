@@ -7,6 +7,20 @@ if [ "${CLAI_STANDALONE:-0}" != 1 ] && [ -x "$managed_root/clai" ] && [ -f "$man
   exec "$managed_root/clai" run local-deepseek -- "$@"
 fi
 
+resolve_claude() {
+  local path
+  if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then
+    path=$CLAI_CLAUDE_BIN
+    case "$path" in /*) ;; *) printf 'CLAI_CLAUDE_BIN must be an absolute executable path\n' >&2; return 127;; esac
+  else
+    path=$(type -P claude) || { printf 'claude is not on PATH\n' >&2; return 127; }
+  fi
+  [ -f "$path" ] && [ -x "$path" ] || { printf 'Claude executable is missing or not executable: %s\n' "$path" >&2; return 127; }
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd)" "${path##*/}"
+}
+
+claude_bin=$(resolve_claude)
+
 # Claude Code against a local Anthropic-compatible DeepSeek server.
 # Existing CLLDS_* overrides remain accepted for the former cllds command.
 BASE_URL="${CLDLS_BASE_URL:-${CLLDS_BASE_URL:-}}"
@@ -19,7 +33,7 @@ CONTEXT_TOKENS="${CLDLS_CONTEXT_TOKENS:-${CLLDS_CONTEXT_TOKENS:-32768}}"
 
 if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
   printf 'Usage: cldls [Claude Code arguments]\n\nSelect Fast, Low, Medium, or High in /model, or use --model cyberneurova-low.\nThese aliases control thinking budgets; the generic effort slider is ignored.\n\nUses %s at %s, with a separate ~/.claude-lds profile.\nPermission checks are bypassed, matching the other provider launchers.\n\n' "$MODEL" "$BASE_URL"
-  exec claude --help
+  exec "$claude_bin" --help
 fi
 
 if [[ -z "$BASE_URL" ]]; then
@@ -27,7 +41,6 @@ if [[ -z "$BASE_URL" ]]; then
   exit 1
 fi
 
-command -v claude >/dev/null 2>&1 || { printf 'cldls: claude is not on PATH.\n' >&2; exit 127; }
 if ! curl -fsS --max-time 180 "${BASE_URL%/}/health" >/dev/null; then
   printf 'cldls: CyberNeurova is unavailable at %s.\nCheck the configured local provider server.\n' "$BASE_URL" >&2
   exit 1
@@ -67,4 +80,4 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export API_TIMEOUT_MS="${CLDLS_API_TIMEOUT_MS:-${CLLDS_API_TIMEOUT_MS:-7200000}}"
 
 mkdir -p "$CLAUDE_CONFIG_DIR"
-exec claude --dangerously-skip-permissions "$@"
+exec "$claude_bin" --dangerously-skip-permissions "$@"

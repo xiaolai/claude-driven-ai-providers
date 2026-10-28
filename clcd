@@ -33,11 +33,24 @@ are rejected because this bridge cannot honor them.
 HELP
 }
 
+resolve_claude() {
+  local path
+  if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then
+    path=$CLAI_CLAUDE_BIN
+    case "$path" in /*) ;; *) printf 'CLAI_CLAUDE_BIN must be an absolute executable path\n' >&2; return 127;; esac
+  else
+    path=$(type -P claude) || { printf 'claude is not on PATH\n' >&2; return 127; }
+  fi
+  [ -f "$path" ] && [ -x "$path" ] || { printf 'Claude executable is missing or not executable: %s\n' "$path" >&2; return 127; }
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd)" "${path##*/}"
+}
+
 die() { printf 'clcd: %s\n' "$*" >&2; exit 1; }
 case "${1:-}" in --help|-h) usage; exit 0;; esac
 transport=${CLCD_TRANSPORT:-codex}
 case "$transport" in codex|openai|grok|gemini|local|api|chat) ;; *) die 'unsupported CLCD_TRANSPORT';; esac
-required_tools="curl jq socat openssl claude"
+claude_bin=$(resolve_claude)
+required_tools="curl jq socat openssl"
 [ "$transport" != codex ] || required_tools="$required_tools lockf codex"
 for tool in $required_tools; do
   command -v "$tool" >/dev/null || die "$tool is not on PATH"
@@ -581,7 +594,7 @@ unset CLCD_API_KEY OPENAI_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY LOCA
 unset CLCD_CONFIG_RESOLVED CLCD_MODEL_MAP
 umask "$caller_umask"
 if [ "$caller_lc_all_set" = x ]; then export LC_ALL="$caller_lc_all"; else unset LC_ALL; fi
-claude --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &
+"$claude_bin" --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &
 claude_pid=$!
 set +e
 wait "$claude_pid"

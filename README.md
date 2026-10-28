@@ -52,6 +52,36 @@ Bridge routes also need socat. The Codex subscription route additionally needs
 Codex CLI, macOS lockf, and a ChatGPT subscription login through `codex login`.
 Ask Claude to check these prerequisites before setup. Linux is not qualified.
 
+### Which Claude executable runs
+
+Launchers use the first `claude` executable on their inherited `PATH`.
+`clai doctor PROVIDER` reports `claude.executable`, its resolved symlink target,
+version (null if unavailable), and the installations found on PATH. Multiple
+installations produce a warning in the JSON `warnings` array. Diagnostics inspect
+the invoking process's environment; a fresh terminal may have a different PATH.
+
+To select an executable explicitly for every provider launcher:
+
+```bash
+export CLAI_CLAUDE_BIN="$HOME/.local/bin/claude"
+clai doctor deepseek
+```
+
+The override must be an absolute path to an executable file. An invalid override
+fails rather than selecting another installation. It also applies to standalone
+`clcd`, `clds`, and `cldls`.
+
+On macOS, `/etc/zprofile` runs `path_helper` before your `~/.zprofile`, and can
+reorder PATH entries set earlier in `~/.zshenv`. If you want `~/.local/bin` first
+in login shells, put `export PATH="$HOME/.local/bin:$PATH"` after other PATH setup
+in `~/.zprofile`, then verify with a fresh login shell. Setup does not edit shell
+profiles.
+
+Install from the checkout on each destination machine. Generated launchers
+contain absolute paths to that installation's runtime; copying them to another
+machine or moving the runtime can leave stale paths. Run `./clai install` on the
+destination to generate its launchers.
+
 ## Choose a provider
 
 | Provider ID | Command | Credential or service |
