@@ -21,6 +21,7 @@ CLAUDE_CODE_AUTO_COMPACT_WINDOW: default 750000 tokens (75% of 1M).
 Claude profile: ~/.claude-codex. Permission checks are bypassed, as in clds.
 
 Requires macOS bash, curl, jq, socat, openssl, lockf, codex, and claude.
+The Codex web-search tool also requires Python 3.
 No external proxy, SDK, or persistent subscription token copy.
 CLCD_TRANSPORT=codex (default), openai, or grok selects explicit billing/auth.
 Gemini/local chat routes use the optional installed adapters via clai.
@@ -55,6 +56,11 @@ required_tools="curl jq socat openssl"
 for tool in $required_tools; do
   command -v "$tool" >/dev/null || die "$tool is not on PATH"
 done
+if [ "$transport" = codex ]; then
+  command -v python3 >/dev/null || die 'Python 3 is required for Codex web search'
+  search_script="$(cd "$(dirname "$0")" && pwd)/codex-web-search.py"
+  [ -f "$search_script" ] || die 'codex-web-search.py is missing; install the complete runtime'
+fi
 if [ "$transport" = codex ]; then
   CLCD_MODEL=${CLCD_MODEL:-${CLAI_CODEX_MODEL:-}}
   CLCD_CONTEXT_TOKENS=${CLCD_CONTEXT_TOKENS:-${CLAI_CODEX_CONTEXT:-}}
@@ -573,6 +579,16 @@ if [ "${1:-}" = --check ]; then
   printf '%s' "$result" | jq -er '[.content[] | select(.type=="text") | .text] | join("") | select(.=="CLCD_OK")' || die 'unexpected provider check response'
   exit
 fi
+
+mcp_args=()
+if [ "$transport" = codex ]; then
+  python_bin=$(type -P python3)
+  jq -cn --arg command "$python_bin" --arg script "$search_script" \
+    '{mcpServers:{codex_web_search:{command:$command,args:[$script]}}}' >"$runtime/mcp.json"
+  mcp_args=(--mcp-config "$runtime/mcp.json" --disallowedTools 'WebSearch,WebFetch' \
+    --append-system-prompt 'For web searches, use the codex_web_search MCP search tool. It uses Codex native web_search and returns source URLs.')
+fi
+if [ "$transport" = codex ]; then set -- "${mcp_args[@]}" "$@"; fi
 
 export CLAUDE_CONFIG_DIR="${CLCD_PROFILE:-$HOME/.claude-codex}"
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES

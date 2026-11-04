@@ -195,6 +195,36 @@ clcd --continue
 cloa --model YOUR_MODEL
 ```
 
+With `clcd`, web searches use a bundled `codex_web_search` MCP tool. The tool
+starts a short, read-only `codex exec --json` turn using your existing Codex
+ChatGPT login and the search mode in your Codex configuration. API-key-only
+Codex authentication is not used by this tool. The search turn ignores other
+user configuration and disables local command, app, plugin, browser,
+computer-use, image, and subagent tools. User-level `[tools]` and `[profiles]`
+settings are unsupported in this isolated turn; the bridge fails clearly rather
+than silently dropping them. Claude Code's built-in `WebSearch` and `WebFetch` tools are
+disabled on this route because they cannot be translated to the Codex Responses
+bridge. Ask Claude Code to search the web;
+the MCP tool returns the answer and source URLs. Python 3 is required for this
+tool. If Codex reports no completed `web_search` event, the tool returns an
+explicit error instead of silently using another search service. Live search
+depends on your Codex `web_search` setting and workspace policy. A search uses
+an additional Codex turn and can consume subscription allowance. The MCP tool
+does not run for the API-backed routes. The Codex turn is stopped after 240
+seconds; if you have lowered Claude Code's `MCP_TOOL_TIMEOUT`, keep it above
+240000 ms. This bridge was verified with Codex CLI 0.166.0 and requires its
+`codex exec --json --ephemeral` interface.
+
+To verify the route manually, run:
+
+```sh
+clcd --print 'Use codex_web_search to find the official Codex CLI documentation and list source URLs.'
+```
+
+Check that the answer contains HTTPS source links. Set `web_search = "disabled"`
+in your Codex configuration to verify that the same request returns an explicit
+tool error.
+
 Claude arguments are forwarded literally. Launcher `--help` shows usage;
 managed launchers also show Claude's options. For the complete management
 interface, run `clai --help`.
@@ -361,8 +391,9 @@ Claude Code → local clcd bridge + jq adapters → Chat Completions endpoint
 
 The [registry](providers.json) selects the route. Codex/OpenAI/Grok use Responses;
 Gemini uses Chat compatibility; documented native providers connect directly.
-`clcd` remains a standalone Bash file for its default Codex route and the
-OpenAI/Grok Responses routes. Gemini/local Chat require the bundled jq adapters.
+`clcd` remains a standalone Bash bridge for its default Codex route and the
+OpenAI/Grok Responses routes. Codex web search uses the adjacent Python helper;
+Gemini/local Chat require the bundled jq adapters.
 The full command family is an installed bundle. Source `clds`/`cldls` retain
 their legacy standalone fallback with `CLAI_STANDALONE=1`.
 

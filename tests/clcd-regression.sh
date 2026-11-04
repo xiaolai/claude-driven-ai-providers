@@ -63,6 +63,13 @@ call() { printf 'header = "x-api-key: %s"\n' "$ANTHROPIC_AUTH_TOKEN" | /usr/bin/
 [ "$ANTHROPIC_MODEL" = legacy-codex ]
 [ "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" = 900001 ]
 [ "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" = 675000 ]
+config=''
+for (( i=1; i<=$#; i++ )); do
+  if [ "${!i}" = --mcp-config ]; then next=$((i+1)); config=${!next}; fi
+done
+[ -n "$config" ] && [ -f "$config" ]
+jq -e '.mcpServers.codex_web_search.args[0] | endswith("/codex-web-search.py")' "$config" >/dev/null
+[[ " $* " == *' --disallowedTools WebSearch,WebFetch '* ]]
 case "$CLCD_TEST_MODE" in
  quota|context)
   status=$(call -D "$CLCD_TEST_STATE/headers" -o "$CLCD_TEST_STATE/body" -w '%{http_code}' -H 'Content-Type: application/json' --data '{"stream":true,"messages":[{"role":"user","content":"test"}]}' "$ANTHROPIC_BASE_URL/v1/messages")
