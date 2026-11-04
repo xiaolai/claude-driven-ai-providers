@@ -306,7 +306,7 @@ install_runtime() {
   printf 'Installing runtime from %s\n' "$root"
   mkdir -p "$bin" "$data/releases"
   stage=$(mktemp -d "$data/releases/.stage.XXXXXXXX")
-  cp "$root/clai" "$root/clcd" "$root/clds" "$root/cldls" "$root/providers.json" "$root/setup.sh" "$root/models.sh" "$stage/"
+  cp "$root/clai" "$root/clcd" "$root/clds" "$root/cldls" "$root/codex-web-search.py" "$root/providers.json" "$root/setup.sh" "$root/models.sh" "$stage/"
   cp -R "$root/adapters" "$stage/"
   cp -R "$root/skills" "$stage/"
   chmod 755 "$stage/clai" "$stage/clcd" "$stage/clds" "$stage/cldls"
@@ -325,6 +325,7 @@ install_runtime() {
     chmod 755 "$stage"; mv -f "$stage" "$bin/$alias"
   done
   stage=$(mktemp "$bin/.clcd.XXXXXXXX"); install -m 755 "$release/clcd" "$stage"; mv -f "$stage" "$bin/clcd"
+  stage=$(mktemp "$bin/.codex-web-search.XXXXXXXX"); install -m 755 "$release/codex-web-search.py" "$stage"; mv -f "$stage" "$bin/codex-web-search.py"
   printf 'Installed provider commands in %s; existing sessions retain their loaded runtime.\n' "$bin"
 }
 command=${1:-help}; [ "$#" -eq 0 ] || shift

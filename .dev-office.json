@@ -1,9 +1,9 @@
 {
   "tests": {
     "tiers": {
-      "edit": "bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh",
-      "pr": "bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh && bash tests/clcd-regression.sh && bash tests/bridge-api.sh",
-      "full": "bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh && bash tests/clcd-regression.sh && bash tests/bridge-api.sh"
+      "edit": "python3 tests/codex-web-search.py && bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh",
+      "pr": "python3 tests/codex-web-search.py && bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh && bash tests/clcd-regression.sh && bash tests/bridge-api.sh",
+      "full": "python3 tests/codex-web-search.py && bash tests/executable.sh && bash tests/launchers.sh && bash tests/system.sh && bash tests/setup.sh && bash tests/models.sh && bash tests/audit-regression.sh && bash tests/clcd-protocol.sh && bash tests/chat.sh && bash tests/clcd-regression.sh && bash tests/bridge-api.sh"
     }
   },
   "release": {

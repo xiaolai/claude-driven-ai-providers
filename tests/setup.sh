@@ -44,6 +44,7 @@ test ! -e "$XDG_CONFIG_HOME/claude-driven-ai-providers/deepseek-api-key"
 ! grep -q "$key" "$tmp/applied"
 [ "$(stat -f '%Lp' "$XDG_CONFIG_HOME/claude-driven-ai-providers/deepseek-api-key")" = 600 ]
 (cd "$tmp"; "$tmp/existing bin/clds" --print fixture)
+test -f "$tmp/existing bin/codex-web-search.py"
 test -f "$HOME/.claude/skills/clai-setup/SKILL.md"
 test -f "$HOME/.claude-deepseek/skills/clai-setup/SKILL.md"
 "$tmp/existing bin/clai" prepare deepseek --out "$tmp/.env-again" >/dev/null
