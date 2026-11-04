@@ -57,6 +57,11 @@ for tool in $required_tools; do
   command -v "$tool" >/dev/null || die "$tool is not on PATH"
 done
 if [ "$transport" = codex ]; then
+  command -v python3 >/dev/null || die 'Python 3 is required for Codex web search'
+  search_script="$(cd "$(dirname "$0")" && pwd)/codex-web-search.py"
+  [ -f "$search_script" ] || die 'codex-web-search.py is missing; install the complete runtime'
+fi
+if [ "$transport" = codex ]; then
   CLCD_MODEL=${CLCD_MODEL:-${CLAI_CODEX_MODEL:-}}
   CLCD_CONTEXT_TOKENS=${CLCD_CONTEXT_TOKENS:-${CLAI_CODEX_CONTEXT:-}}
   CLCD_EFFORT=${CLCD_EFFORT:-${CLAI_CODEX_EFFORT:-}}
@@ -577,15 +582,13 @@ fi
 
 mcp_args=()
 if [ "$transport" = codex ]; then
-  command -v python3 >/dev/null || die 'Python 3 is required for Codex web search'
-  search_script="$(cd "$(dirname "$0")" && pwd)/codex-web-search.py"
-  [ -f "$search_script" ] || die 'codex-web-search.py is missing; install the complete runtime'
   python_bin=$(type -P python3)
   jq -cn --arg command "$python_bin" --arg script "$search_script" \
     '{mcpServers:{codex_web_search:{command:$command,args:[$script]}}}' >"$runtime/mcp.json"
   mcp_args=(--mcp-config "$runtime/mcp.json" --disallowedTools 'WebSearch,WebFetch' \
     --append-system-prompt 'For web searches, use the codex_web_search MCP search tool. It uses Codex native web_search and returns source URLs.')
 fi
+if [ "$transport" = codex ]; then set -- "${mcp_args[@]}" "$@"; fi
 
 export CLAUDE_CONFIG_DIR="${CLCD_PROFILE:-$HOME/.claude-codex}"
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
@@ -607,7 +610,7 @@ unset CLCD_API_KEY OPENAI_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY LOCA
 unset CLCD_CONFIG_RESOLVED CLCD_MODEL_MAP
 umask "$caller_umask"
 if [ "$caller_lc_all_set" = x ]; then export LC_ALL="$caller_lc_all"; else unset LC_ALL; fi
-"$claude_bin" --dangerously-skip-permissions "${mcp_args[@]}" "$@" <&0 5>&- 6>&- &
+"$claude_bin" --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &
 claude_pid=$!
 set +e
 wait "$claude_pid"

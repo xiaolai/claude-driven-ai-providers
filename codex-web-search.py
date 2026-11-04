@@ -24,6 +24,51 @@ TOOL = {
         "additionalProperties": False,
     },
 }
+PROTOCOL_VERSION = "2025-03-26"
+PASSTHROUGH_ENV = {
+    "HOME", "USER", "LOGNAME", "PATH", "CODEX_HOME", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+}
+
+
+def configured_search_mode(env):
+    """Carry only the user's search mode into an otherwise isolated Codex turn."""
+    home = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    path = os.path.join(home, "config.toml")
+    try:
+        with open(path, encoding="utf-8") as config:
+            lines = config.readlines()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("Could not read Codex search configuration") from exc
+    section = ""
+    mode = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = re.sub(r"[\s'\"]", "", stripped)
+            if section.startswith("[profiles]") or section.startswith("[profiles."):
+                raise RuntimeError("Profile-specific Codex web_search configuration is unsupported")
+            if section.startswith("[tools]") or section.startswith("[tools."):
+                raise RuntimeError("Codex web_search tool filters require an isolated search profile")
+            continue
+        key = re.sub(r"[\s'\"]", "", stripped.split("=", 1)[0])
+        if section == "" and (key in {"profile", "profiles"} or key.startswith("profiles.")):
+            raise RuntimeError("Profile-specific Codex web_search configuration is unsupported")
+        if section == "" and (key == "tools" or key.startswith("tools.")):
+            raise RuntimeError("Codex web_search tool filters require an isolated search profile")
+        if key == "web_search" and section == "":
+            match = re.fullmatch(r'web_search\s*=\s*["\'](disabled|cached|indexed|live)["\']\s*(?:#.*)?', stripped)
+            if not match:
+                raise RuntimeError("Unsupported Codex web_search configuration")
+            mode = match.group(1)
+        elif key == "web_search" and section != "":
+            raise RuntimeError("Profile-specific Codex web_search configuration is unsupported")
+    return mode
 
 
 def search(query):
@@ -39,23 +84,28 @@ def search(query):
         "of each source. If web search is disabled or unavailable, say so.\n\n"
         f"Query: {query}"
     )
-    env = os.environ.copy()
-    for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
-        env.pop(name, None)
+    env = {name: value for name, value in os.environ.items() if name in PASSTHROUGH_ENV}
+    search_mode = configured_search_mode(env)
     with tempfile.TemporaryDirectory(prefix="clcd-web-search-") as directory:
         command = [
             "codex", "exec", "--json", "--ephemeral", "--sandbox", "read-only",
-            "--skip-git-repo-check", "-c", 'approval_policy="never"',
-            "-C", directory, prompt,
+            "--skip-git-repo-check", "--ignore-user-config",
+            "-c", 'approval_policy="never"',
+            "--disable", "shell_tool", "--disable", "apps", "--disable", "plugins",
+            "--disable", "browser_use", "--disable", "computer_use",
+            "--disable", "view_image", "--disable", "multi_agent",
         ]
+        if search_mode is not None:
+            command.extend(("-c", f'web_search="{search_mode}"'))
+        command.extend(("-C", directory, prompt))
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", stdin=subprocess.DEVNULL, timeout=120, env=env,
+                errors="replace", stdin=subprocess.DEVNULL, timeout=240, env=env,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Codex web search timed out after 120 seconds") from exc
+            raise RuntimeError("Codex web search timed out after 240 seconds") from exc
         except OSError as exc:
             raise RuntimeError("Could not start Codex CLI") from exc
 
@@ -124,9 +174,8 @@ def search(query):
 def respond(request):
     method = request.get("method")
     if method == "initialize":
-        version = (request.get("params") or {}).get("protocolVersion", "2025-03-26")
         result = {
-            "protocolVersion": version,
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "clcd-codex-web-search", "version": "1.0.0"},
         }
