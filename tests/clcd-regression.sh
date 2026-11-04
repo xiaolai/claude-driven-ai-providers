@@ -5,6 +5,7 @@ script="$repo/clcd"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/provider-tests.XXXXXXXX")
 trap 'rm -rf -- "$test_dir"' EXIT
 cd "$test_dir"
+export XDG_CONFIG_HOME="$test_dir/config"
 mkdir -p hardening-bin filters
 cat > hardening-bin/codex <<'MOCK'
 #!/bin/bash

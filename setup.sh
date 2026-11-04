@@ -41,6 +41,7 @@ prepare_setup() (
     if [ "$(printf '%s' "$provider"|jq -r .auth)" = local ]; then
       printf '# Local server root, not /v1/messages or /chat/completions.\nBASE_URL=\nPROTOCOL=%s\n' "$(printf '%s' "$cfg"|jq -r .protocol)"
     fi
+    if [ "$id" = codex ]; then printf 'WEB_SEARCH=\nWEB_SEARCH_UNBOUNDED=\n'; fi
     printf 'BIN_DIR=%s\n' "$bin"
   } >"$stage"
   chmod 600 "$stage"
@@ -66,7 +67,7 @@ parse_setup() {
       value=${value:1:${#value}-2}
     fi
     case "$key" in
-      PROVIDER|MODEL|CONTEXT_TOKENS|AUTO_COMPACT_TOKENS|EFFORT|MAX_OUTPUT_TOKENS|BASE_URL|PROTOCOL|BIN_DIR|MAPPING_STRATEGY|QUALITY_MODEL|STANDARD_MODEL|FAST_MODEL|OPUS_MODEL|FABLE_MODEL|SONNET_MODEL|HAIKU_MODEL|SUBAGENT_MODEL|CUSTOM_MODEL)
+      PROVIDER|WEB_SEARCH|WEB_SEARCH_UNBOUNDED|MODEL|CONTEXT_TOKENS|AUTO_COMPACT_TOKENS|EFFORT|MAX_OUTPUT_TOKENS|BASE_URL|PROTOCOL|BIN_DIR|MAPPING_STRATEGY|QUALITY_MODEL|STANDARD_MODEL|FAST_MODEL|OPUS_MODEL|FABLE_MODEL|SONNET_MODEL|HAIKU_MODEL|SUBAGENT_MODEL|CUSTOM_MODEL)
         setup_values=$(printf '%s' "$setup_values"|jq -c --arg key "$key" --arg value "$value" '.+{($key):$value}');;
       *)
         if [ "$key" != API_KEY ]; then jq -e --arg key "$key" 'any(.providers[];.key_env==$key or .alt_env==$key)' "$registry" >/dev/null || fail "unsupported field at line $number"; fi
@@ -115,7 +116,7 @@ apply_setup() {
   fi
   file="$config_root/providers/$id.json"; if [ -e "$file" ]; then old=$(cat "$file"); fi
   changes=$(printf '%s' "$setup_values"|jq -c '
-    {MODEL:"model",CONTEXT_TOKENS:"context",AUTO_COMPACT_TOKENS:"compact",EFFORT:"effort",MAX_OUTPUT_TOKENS:"max_output_tokens",BASE_URL:"base_url",PROTOCOL:"protocol"} as $map |
+    {WEB_SEARCH:"web_search",WEB_SEARCH_UNBOUNDED:"web_search_unbounded",MODEL:"model",CONTEXT_TOKENS:"context",AUTO_COMPACT_TOKENS:"compact",EFFORT:"effort",MAX_OUTPUT_TOKENS:"max_output_tokens",BASE_URL:"base_url",PROTOCOL:"protocol"} as $map |
     reduce to_entries[] as $item ({}; if $item.value!="" and $map[$item.key]!=null then .+{($map[$item.key]):$item.value} else . end)')
   strategy=$(printf '%s' "$setup_values"|jq -r '.MAPPING_STRATEGY//empty')
   case "$strategy" in ''|single|quality|balanced|economy|manual) ;;*) fail 'unknown mapping strategy';;esac

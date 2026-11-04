@@ -71,3 +71,21 @@ grep -Fq "Installing runtime from $releases/" "$tmp/install-source"
 "$repo/clai" install --bin "$tmp/installed bin" >/dev/null
 [ "$(find "$XDG_DATA_HOME/claude-driven-ai-providers/releases" -mindepth 1 -maxdepth 1 -type d|wc -l|tr -d ' ')" = 3 ]
 printf 'PASS: registry, private credentials/config, precedence, argv, diagnostics, URL and permission guards, relocatable atomic installation\n'
+
+"$repo/clai" config set codex web_search live >/dev/null
+"$repo/clai" config set codex web_search_unbounded true >/dev/null
+"$repo/clai" config show codex | jq -e '.web_search=="live" and .web_search_unbounded==true and (.web_search_configuration|startswith("stored"))' >/dev/null
+for assignment in 'web_search invalid' 'web_search_unbounded yes'; do
+  read -r field value <<<"$assignment"
+  if "$repo/clai" config set codex "$field" "$value" >/dev/null 2>&1;then echo 'invalid search setting accepted';exit 1;fi
+done
+if "$repo/clai" config set deepseek web_search live >/dev/null 2>&1;then echo 'native search leaked into native Anthropic route';exit 1;fi
+"$repo/clai" config unset codex web_search >/dev/null
+"$repo/clai" config unset codex web_search_unbounded >/dev/null
+"$repo/clai" config show codex | jq -e '.web_search=="disabled" and .web_search_unbounded==false' >/dev/null
+printf 'PASS: Codex search configuration, explicit unbounded policy, repairable invalid settings and route isolation\n'
+
+printf '{"web_search":false}\n' >"$XDG_CONFIG_HOME/claude-driven-ai-providers/providers/codex.json"
+if "$repo/clai" config show codex >/dev/null 2>&1;then echo 'boolean search mode accepted';exit 1;fi
+"$repo/clai" config unset codex web_search >/dev/null
+printf 'PASS: malformed JSON search mode rejected and repairable\n'

@@ -18,7 +18,7 @@ Usage: clai list [--json]
        clai models PROVIDER
        clai probe PROVIDER [--cached] [--model ID --check-tools]
        clai map PROVIDER --strategy STRATEGY [tier/role overrides] [--apply] [--check-tools]
-       clai check PROVIDER [--model ID] [--tools]
+       clai check PROVIDER [--model ID] [--tools|--search]
        clai config show PROVIDER
        clai config set PROVIDER FIELD VALUE
        clai config unset PROVIDER FIELD
@@ -27,7 +27,8 @@ Usage: clai list [--json]
 
 Provider IDs and aliases: clai list
 Configuration fields: model, base_url (local only), context, compact, effort,
-max_output_tokens, protocol (local only: anthropic or chat).
+max_output_tokens, protocol (local only: anthropic or chat),
+web_search (Codex: disabled/cached/live), web_search_unbounded (Codex: true/false).
 Effort: Codex/OpenAI low/medium/high/xhigh; Gemini low/medium/high.
 Keys are read from provider environment variables, then private mode-600 files.
 No key values are displayed. 'check' invokes a model and can incur API charges.
@@ -64,11 +65,11 @@ select_provider() {
   if [ "$mode" = key ]; then cfg=$provider; return; fi
   file="$config_root/providers/$id.json"
   if [ -e "$file" ]; then private_file "$file"; overrides=$(cat "$file"); fi
-  printf '%s' "$overrides" | jq -e 'type=="object" and ((keys-["model","base_url","context","compact","effort","max_output_tokens","protocol","mapping"])|length==0)' >/dev/null || fail 'unknown or invalid private config fields'
+  printf '%s' "$overrides" | jq -e 'type=="object" and ((keys-["model","base_url","context","compact","effort","max_output_tokens","protocol","mapping","web_search","web_search_unbounded"])|length==0)' >/dev/null || fail 'unknown or invalid private config fields'
   cfg=$(printf '%s' "$provider" | jq -c --argjson overrides "$overrides" '.+$overrides')
   if [ "$mode" = runtime ]; then
     upper=$(printf '%s' "$id" | tr '[:lower:]-' '[:upper:]_')
-    for field in model base_url context compact effort max_output_tokens; do
+    for field in model base_url context compact effort max_output_tokens web_search web_search_unbounded; do
       prefix="CLAI_${upper}_$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]')"
       value=${!prefix:-}
       if [ -n "$value" ]; then cfg=$(printf '%s' "$cfg" | jq -c --arg k "$field" --arg v "$value" '.+{($k):$v}'); fi
@@ -76,6 +77,8 @@ select_provider() {
     case "$id" in
       codex) value=${CLCD_MODEL:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.model=$v')
         value=${CLCD_CONTEXT_TOKENS:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.context=$v')
+        value=${CLCD_WEB_SEARCH:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.web_search=$v')
+        value=${CLCD_WEB_SEARCH_UNBOUNDED:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.web_search_unbounded=$v')
         value=${CLCD_EFFORT:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.effort=$v');;
       deepseek) value=${CLDS_MODEL:-}; [ -z "$value" ] || cfg=$(printf '%s' "$cfg"|jq -c --arg v "$value" '.model=$v');;
       local-deepseek)
@@ -115,6 +118,11 @@ validate_config() {
   printf '%s' "$cfg"|jq -e '.context>=1000 and .context<=2000000 and .context==(.context|floor) and .compact>0 and .compact<=.context and .compact==(.compact|floor) and
     (.max_output_tokens==null or (.max_output_tokens>0 and .max_output_tokens<=.context and .max_output_tokens==(.max_output_tokens|floor))) and
     (.protocol|IN("anthropic","responses","chat")) and (.model|type=="string") and (.base_url|type=="string")' >/dev/null || fail 'invalid context/compact/output/protocol configuration'
+  cfg=$(printf '%s' "$cfg"|jq -ce '
+    .web_search=(if .web_search==null then "disabled" else .web_search end) |
+    .web_search_unbounded=(if .web_search_unbounded==null then false elif .web_search_unbounded=="true" then true elif .web_search_unbounded=="false" then false else .web_search_unbounded end) |
+    if (.web_search|IN("disabled","cached","live")) and (.web_search_unbounded|type=="boolean") and
+       (.id=="codex" or (.web_search=="disabled" and .web_search_unbounded==false)) then . else error("invalid native search configuration; Codex only") end') || fail 'invalid native search configuration; Codex only'
   if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then
     printf '%s' "$cfg"|jq -e '.effort as $effort | (.effort_levels//[])|index($effort)!=null' >/dev/null || fail 'reasoning effort is unsupported for this route/value; remove it with config unset or use a supported provider'
     printf '%s' "$cfg"|jq -e '.effort as $effort | .mapping.bounds.effort_levels==null or (.mapping.bounds.effort_levels|index($effort)!=null)' >/dev/null || fail 'effort is unsupported by one or more mapped models'
@@ -210,9 +218,11 @@ doctor() {
     fi
   fi
   jq -cn --arg provider "$id" --arg state "$state" --arg source "$key_source" --arg tools "$missing" \
+    --arg mode "$(printf '%s' "$cfg"|jq -r .web_search)" --argjson unbounded "$(printf '%s' "$cfg"|jq -r .web_search_unbounded)" \
     --arg executable "$claude_bin" --arg target "$resolved" --arg version "$version" --argjson candidates "$candidates" \
     --arg selection "$(if [ "${CLAI_CLAUDE_BIN+x}" = x ]; then printf override; else printf PATH; fi)" \
     '{provider:$provider,state:$state,credential_source:$source,missing_tools:$tools,
+      native_search:{mode:$mode,unbounded:$unbounded,verification:"not-tested"},
       claude:{executable:(($executable|select(length>0))//null),resolved_target:(($target|select(length>0))//null),
         version:(($version|select(length>0))//null),selection:$selection,path_candidates:$candidates},
       warnings:[if ($candidates|length)>1 then "Multiple Claude installations on PATH; check claude.executable" else empty end]}'
@@ -247,6 +257,8 @@ run_provider() {
     CLCD_MODEL_MAP=$(printf '%s' "$cfg"|jq -c '.mapping.models//{}');export CLCD_MODEL_MAP
     export CLCD_TRANSPORT="$bridge_transport" CLCD_MODEL="$selected" CLCD_CONTEXT_TOKENS="$context" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact" CLCD_PROFILE="$profile" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$output"
     if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then export CLCD_EFFORT="$effort"; else unset CLCD_EFFORT; fi
+    CLCD_WEB_SEARCH=$(printf '%s' "$cfg"|jq -r .web_search); CLCD_WEB_SEARCH_UNBOUNDED=$(printf '%s' "$cfg"|jq -r .web_search_unbounded)
+    export CLCD_WEB_SEARCH CLCD_WEB_SEARCH_UNBOUNDED
     export CLCD_API_KEY="$credential"
     scrub_provider_keys
     if [ "$protocol" = chat ]; then
@@ -358,11 +370,11 @@ case "$command" in
     action=${1:-}; name=${2:-}; [ -n "$name" ] || fail 'usage: clai config show|set PROVIDER [FIELD VALUE]'
     if [ "$action" = show ]; then select_provider "$name" stored; else select_provider "$name" edit; fi
     case "$action" in
-      show) printf '%s\n' "$cfg"|jq .;;
+      show) printf '%s\n' "$cfg"|jq 'if .id=="codex" then .+{web_search_configuration:"stored; use doctor for effective environment overrides"} else . end';;
       set|unset)
         if [ "$action" = set ]; then [ "$#" -eq 4 ] || fail 'usage: clai config set PROVIDER FIELD VALUE'; else [ "$#" -eq 3 ] || fail 'usage: clai config unset PROVIDER FIELD'; fi
         field=$3; value=${4:-}
-        case "$field" in model|base_url|context|compact|effort|max_output_tokens|protocol) ;; mapping) [ "$action" = unset ] || fail 'use clai map to set mappings';; *) fail 'unsupported configuration field (keys use clai key set)';; esac
+        case "$field" in model|base_url|context|compact|effort|max_output_tokens|protocol|web_search|web_search_unbounded) ;; mapping) [ "$action" = unset ] || fail 'use clai map to set mappings';; *) fail 'unsupported configuration field (keys use clai key set)';; esac
         mkdir -p "$config_root/providers"; chmod 700 "$config_root" "$config_root/providers"
         file="$config_root/providers/$id.json"; old='{}'; if [ -e "$file" ]; then private_file "$file"; old=$(cat "$file"); fi
         if [ "$action" = set ]; then changed=$(printf '%s' "$old"|jq -c --arg k "$field" --arg v "$value" '.+{($k):$v}'); else changed=$(printf '%s' "$old"|jq -c --arg k "$field" 'del(.[$k])'); fi
@@ -389,15 +401,27 @@ case "$command" in
     printf 'Stored private credential for %s; value not displayed.\n' "$id";;
   check)
     [ -n "${1:-}" ] || fail 'usage: clai check PROVIDER [--tools]'
-    name=$1;shift;tool_check='';check_model='';check_effort='';check_context='';check_output='';check_args=()
+    name=$1;shift;tool_check='';check_model='';check_effort='';check_context='';check_output='';search_check=false;check_args=()
     while [ "$#" -gt 0 ];do
-      case "$1" in --tools) tool_check=--tools;;
+      case "$1" in --tools) tool_check=--tools;; --search) search_check=true;;
         --model|--effort|--context|--max-output-tokens) [ "$#" -ge 2 ] || fail 'check option needs a value';case "$1" in --model) check_model=$2;;--effort) check_effort=$2;;--context) check_context=$2;;*) check_output=$2;;esac;shift;;
         *) fail 'unknown check option';;
       esac;shift
     done
     if [ -z "$check_model" ] && [ -n "$check_effort$check_context$check_output" ];then fail 'check bounds/effort require --model';fi
     if [ -n "$check_model" ];then check_args=(--model "$check_model");fi
+    if [ "$search_check" = true ]; then
+      [ -z "$tool_check" ] || fail 'run search and Bash tool checks separately'
+      select_provider "$name"
+      [ "$id" = codex ] || fail 'native search check requires Codex'
+      if [ -n "$check_model" ]; then
+        cfg=$(printf '%s' "$cfg"|jq -c --arg model "$check_model" 'del(.mapping)|.model=$model')
+      fi
+      [ -z "$check_effort$check_context$check_output" ] || fail 'search check accepts --model only'
+      validate_config
+      run_provider --check-search
+      exit
+    fi
     tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
     expected="CLAI_OK_$(openssl rand -hex 4)"
     prompt="Reply with exactly $expected"; tools=''; turns=1
