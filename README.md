@@ -321,6 +321,87 @@ Authenticated plain HTTP is restricted to numeric loopback (`127.0.0.1` or
 `[::1]`). Remote authenticated servers need HTTPS. Discovery alone does not
 establish reliable tool use; run a live tool check against the chosen model.
 
+## Native web search with Codex
+
+Codex subscription launches can use OpenAI-hosted web search through Claude Code's
+built-in `WebSearch` tool. Search is off by default. Enable it explicitly:
+
+```bash
+clai config set codex web_search live
+clai config set codex web_search_unbounded true
+clcd
+```
+
+`web_search` accepts `disabled`, `cached`, or `live`. `cached` disables live
+external access in the hosted tool; `live` allows it. Both modes still contact
+OpenAI. `CLCD_WEB_SEARCH` / `CLCD_WEB_SEARCH_UNBOUNDED` override the stored values;
+`CLAI_CODEX_WEB_SEARCH` / `CLAI_CODEX_WEB_SEARCH_UNBOUNDED` are the generic forms.
+The standalone variables have precedence. `config show` reports stored settings;
+`doctor codex` reports the effective mode, unbounded policy, and untested status.
+Neither diagnostics nor installation automatically runs a search.
+
+**The unbounded setting is a deliberate compatibility choice.** Claude Code's
+current search executor sends `max_uses:8`, but the subscription endpoint rejects
+both `max_tool_calls` and the hosted tool's `max_uses`. The default policy refuses
+that request. Setting `web_search_unbounded=true` explicitly permits dropping
+only that known `max_uses:8` limit; a request can perform more searches and consume
+more subscription quota. Other limits are not relaxed. Reset the setting to
+`false` to restore refusal; a timeout is not a search-count limit.
+
+The outer `WebSearch` remains a normal Claude Code function, so its permission
+checks and PreToolUse hooks still run. Only its separate execution request with
+a sole `web_search_20250305` hosted tool is translated. No third-party search MCP
+or OpenAI Platform API key is required. Search does not silently fall back to API
+billing or another provider.
+
+Search responses are buffered up to 8 MiB until the upstream completes cleanly,
+then returned with clickable Markdown citations. Search text appears in a batch;
+other model requests retain token streaming. While waiting, the bridge can send
+HTTP 102 informational responses so that a disconnected client is detected.
+The local Claude-to-bridge hop bypasses environment proxies; upstream provider
+requests retain their existing proxy settings.
+Completed native search actions also return `server_tool_use` activity blocks,
+so Claude Code's “Did N searches” counter reflects executed searches. Page-open
+and find-in-page operations are not counted as searches; `WebFetch` is separate.
+The outer tool receives the source links in its normal result and can use them
+in later turns. Search execution is counted from completed upstream tool items,
+not from a model claiming it searched. Internal search reference IDs are not a
+cross-turn persistence interface.
+
+The initial supported subset includes bare `allowed_domains`. Domain paths,
+`blocked_domains`, location controls, dynamic filtering, unknown tool versions or
+options, mixed hosted/function execution requests, and other `max_uses` values
+are rejected explicitly. This feature is Codex-only; it does not enable hosted
+search on Gemini, Grok, local Chat, or native Anthropic routes.
+
+Run an explicit generation/search check (consumes subscription quota):
+
+```bash
+clai check codex --search
+clai check codex --search --model YOUR_MODEL
+```
+
+Verified on 2026-11-04: real subscription search checks passed for
+`gpt-6.1-sol`, `gpt-6-astra`, and `gpt-6-luna` in live mode, and Sol in cached
+mode. A real Claude Code WebSearch round trip returned source links. This is
+account-specific evidence; other models and accounts still need their own check.
+
+The check requires completed search evidence and source citations. It reports
+`search_executed`, mode, model, the unbounded policy and hosted search operation
+count. Run `--tools` separately to verify Bash. A search check does not qualify
+all models or replace a real Claude Code tool-loop check.
+
+Prepared Codex setup files support `WEB_SEARCH=` and `WEB_SEARCH_UNBOUNDED=`;
+blank fields preserve existing values. Disable search with:
+
+```bash
+clai config set codex web_search disabled
+```
+
+Before restoring an older runtime that rejects new config fields, use the new
+runtime to unset both `web_search` and `web_search_unbounded`. Existing sessions
+keep their loaded version; restart `clcd` to load source or configuration changes.
+
 ## Private data and installation
 
 Credentials come from the provider's environment variable, then its private key

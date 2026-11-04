@@ -10,12 +10,16 @@ usage() {
   cat <<'HELP'
 Usage: clcd [Claude Code arguments]
        clcd --check
+       clcd --check-search
 
 Runs Claude Code through a private, local Anthropic-to-Codex bridge.
 Uses your existing `codex login` ChatGPT subscription, without an API key.
 Default model: gpt-6.1-sol. Set CLCD_MODEL or pass --model to select another.
 CLCD_EFFORT: low, medium (default), high, xhigh.
 CLCD_CONTEXT_TOKENS: Claude's context limit (default: 1000000).
+CLCD_WEB_SEARCH: disabled (default), cached, live; native search execution only.
+CLCD_WEB_SEARCH_UNBOUNDED=true: explicitly waive Claude search max_uses:8.
+Search responses are buffered up to 8 MiB and include clickable citations.
 CLCD_HEADER_TIMEOUT: upstream response-header deadline (default: 120 seconds).
 CLAUDE_CODE_AUTO_COMPACT_WINDOW: default 750000 tokens (75% of 1M).
 Claude profile: ~/.claude-codex. Permission checks are bypassed, as in clds.
@@ -56,6 +60,8 @@ for tool in $required_tools; do
   command -v "$tool" >/dev/null || die "$tool is not on PATH"
 done
 if [ "$transport" = codex ]; then
+  CLCD_WEB_SEARCH=${CLCD_WEB_SEARCH:-${CLAI_CODEX_WEB_SEARCH:-}}
+  CLCD_WEB_SEARCH_UNBOUNDED=${CLCD_WEB_SEARCH_UNBOUNDED:-${CLAI_CODEX_WEB_SEARCH_UNBOUNDED:-}}
   CLCD_MODEL=${CLCD_MODEL:-${CLAI_CODEX_MODEL:-}}
   CLCD_CONTEXT_TOKENS=${CLCD_CONTEXT_TOKENS:-${CLAI_CODEX_CONTEXT:-}}
   CLCD_EFFORT=${CLCD_EFFORT:-${CLAI_CODEX_EFFORT:-}}
@@ -68,6 +74,8 @@ mapping_bounds='{}'
 profile_file="${XDG_CONFIG_HOME:-$HOME/.config}/claude-driven-ai-providers/providers/$transport.json"
 if [ "${CLCD_CONFIG_RESOLVED:-0}" != 1 ] && [ -f "$profile_file" ]; then
   [ ! -L "$profile_file" ] && [ "$(stat -f '%u' "$profile_file")" = "$(id -u)" ] && [ "$((8#$(stat -f '%Lp' "$profile_file") & 077))" -eq 0 ] || die 'provider configuration must be private and owned by you'
+  [ -n "${CLCD_WEB_SEARCH:-}" ] || CLCD_WEB_SEARCH=$(jq -r '.web_search//empty' "$profile_file")
+  [ -n "${CLCD_WEB_SEARCH_UNBOUNDED:-}" ] || CLCD_WEB_SEARCH_UNBOUNDED=$(jq -r 'if .web_search_unbounded==null then empty else .web_search_unbounded end' "$profile_file")
   [ -n "${CLCD_MODEL:-}" ] || CLCD_MODEL=$(jq -r '.model//empty' "$profile_file")
   [ -n "${CLCD_CONTEXT_TOKENS:-}" ] || CLCD_CONTEXT_TOKENS=$(jq -r '.context//empty' "$profile_file")
   [ -n "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] || CLAUDE_CODE_AUTO_COMPACT_WINDOW=$(jq -r '.compact//empty' "$profile_file")
@@ -88,6 +96,11 @@ if [ "$mapping_bounds" != '{}' ];then
     CLAUDE_CODE_MAX_OUTPUT_TOKENS=$(printf '%s' "$mapping_bounds"|jq -er --argjson context "$context" --arg output "${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}" '[.output_tokens,($output|if .=="" then 4096 else tonumber end),$context]|min|select(type=="number" and .>0 and .==floor)') || die 'invalid mapped output bound'
   fi
 fi
+web_search=${CLCD_WEB_SEARCH:-disabled}
+web_search_unbounded=${CLCD_WEB_SEARCH_UNBOUNDED:-false}
+case "$web_search" in disabled|cached|live) ;; *) die 'invalid CLCD_WEB_SEARCH';; esac
+case "$web_search_unbounded" in true|false) ;; *) die 'invalid CLCD_WEB_SEARCH_UNBOUNDED';; esac
+if [ "$transport" != codex ] && { [ "$web_search" != disabled ] || [ "$web_search_unbounded" != false ]; }; then die 'native search is supported only on the Codex route'; fi
 model=${CLCD_MODEL:-gpt-6.1-sol}
 api_key=''
 case "$transport" in
@@ -220,6 +233,27 @@ auth >/dev/null || die 'ChatGPT authentication is unavailable; run codex login, 
 
 cat >"$runtime/request.jq" <<'JQ'
 def wire($name): ($names[0][$name] // $name);
+# Only the hosted execution subrequest is translated. WebSearch functions stay local.
+def native_search:
+  [(.tools//[])[]|select((.type//""|startswith("web_search_")))] as $hosted |
+  if ($hosted|length)==0 then null
+  elif ($hosted|length)!=1 or (.tools|length)!=1 then error("Native search requires a sole hosted search tool")
+  elif ($ARGS.named.search_mode//"disabled")=="disabled" then error("Native search is disabled; set Codex web_search to live or cached")
+  elif $ARGS.named.transport!="codex" then error("Native search requires the Codex route")
+  else $hosted[0] as $t |
+    if $t.type!="web_search_20250305" or $t.name!="web_search" then error("Unsupported hosted search version or name")
+    elif (($t|keys)-["type","name","max_uses","allowed_domains","blocked_domains","cache_control","allowed_callers"]|length)>0 then error("Unsupported hosted search option")
+    elif $t.blocked_domains!=null and ($t.blocked_domains|type)!="array" then error("blocked_domains must be an array")
+    elif ($t.blocked_domains//[]|length)>0 then error("blocked_domains is not supported by native search")
+    elif $t.allowed_callers!=null and $t.allowed_callers!=["direct"] then error("Code-executed search is unsupported")
+    elif $t.max_uses!=null and ($t.max_uses!=8 or $ARGS.named.search_unbounded!="true") then error("Codex cannot enforce max_uses; max_uses:8 requires explicit web_search_unbounded=true")
+    elif ($t.allowed_domains!=null and ($t.allowed_domains|type)!="array") or any(($t.allowed_domains//[])[];type!="string" or (test("^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$")|not)) then error("Native search only supports bare allowed_domains")
+    elif .tool_choice.type=="none" then error("Search is not allowed by tool_choice:none")
+    elif (.tool_choice.type//"auto"|IN("auto","any","tool")|not) or (.tool_choice.type=="tool" and .tool_choice.name!="web_search") then error("Unsupported search tool_choice")
+    else {type:"web_search",external_web_access:($ARGS.named.search_mode=="live")}+
+      (if ($t.allowed_domains//[]|length)>0 then {filters:{allowed_domains:$t.allowed_domains}} else {} end)
+    end
+  end;
 def selected_model:
   .model as $requested | ($ARGS.named.mapping//{}) as $map |
   if $requested==null then $model
@@ -249,7 +283,7 @@ def inputs:
       elif $b.type == "thinking" or $b.type == "redacted_thinking" then .
       else . + [message($role;[$b])] end)
     end) | add // [];
-. as $original |
+. as $original | native_search as $search |
 .output_config.effort as $requested_effort |
 if .temperature!=null or .top_p!=null or .top_k!=null or ((.stop_sequences // [])|length)>0 then
   error("Sampling parameters and stop_sequences are unsupported by this Codex bridge")
@@ -267,8 +301,9 @@ else . end |
   instructions:(if (.system|type)=="string" then .system else [(.system // [])[] | .text // ""] | join("\n") end),
   input:inputs, store:false, stream:true,
   reasoning:{effort:(if $ARGS.named.effort_override=="true" then $effort else .output_config.effort // $effort end)}, parallel_tool_calls:(.tool_choice.disable_parallel_tool_use != true),
-  tools:[(.tools // [])[] | if (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end]
-} + (if .tool_choice.type == "any" then {tool_choice:"required"}
+  tools:(if $search!=null then [$search] else [(.tools // [])[] | if (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end] end)
+} + (if $search!=null then (if ($original.tool_choice.type|IN("any","tool")) then {tool_choice:{type:"web_search"}} else {tool_choice:"auto"} end)
+     elif .tool_choice.type == "any" then {tool_choice:"required"}
      elif .tool_choice.type == "none" then {tool_choice:"none"}
      elif .tool_choice.type == "tool" then {tool_choice:{type:"function",name:wire(.tool_choice.name)}} else {} end) |
 if $ARGS.named.transport!=null and $ARGS.named.transport!="codex" then
@@ -321,6 +356,79 @@ foreach (inputs, "__clcd_eof__") as $rawline
    emit)
 JQ
 
+
+cat >"$runtime/search-response.jq" <<'JQ'
+# A complete bounded Responses SSE body enters this filter only after curl exits.
+def valid_url: type=="string" and test("^https?://[^\\s<>\"\\x00-\\x1f]+$");
+def link_url: gsub("\\(";"%28")|gsub("\\)";"%29")|gsub("\\[";"%5B")|gsub("\\]";"%5D")|gsub("\\\\";"%5C");
+def cited_text:
+  (.text//.refusal//"") as $text |
+  [(.annotations//[])[]|select(.type=="url_citation")|
+    if (.url|valid_url) and (.start_index|type=="number") and (.end_index|type=="number") and
+       .start_index>=0 and .end_index>=.start_index and .end_index<=($text|length) and
+       .start_index==(.start_index|floor) and .end_index==(.end_index|floor)
+    then . else error("Invalid search citation") end] | sort_by(.start_index,.end_index) as $annotations |
+  ($annotations|group_by([.start_index,.end_index])) as $groups |
+  reduce $groups[] as $group ({text:"",pos:0,n:0};
+    $group[0] as $a |
+    if $a.start_index<.pos then error("Overlapping search citations") else
+      ($text[$a.start_index:$a.end_index]) as $span |
+      .text+=($text[.pos:$a.start_index]+(if ($span|test("^cite[^]+$")) then "" else $span end)) |
+      reduce ($group|unique_by(.url))[] as $source (.; .n+=1 | .text+=("["+(.n|tostring)+"]("+($source.url|link_url)+")")) |
+      .pos=$a.end_index end) |
+  (.text+$text[.pos:]) as $rendered |
+  if ($rendered|test("cite|navlist")) then error("Unresolved search citation markers") else $rendered end;
+[split("\n")[]|rtrimstr("\r")|select(startswith("data:"))|.[5:]|ltrimstr(" ")|select(.!="[DONE]")|fromjson] as $events |
+if ($events|length)==0 then error("Empty search stream") else . end |
+[$events|to_entries[]|select(.value.type|IN("response.completed","response.incomplete","response.failed","error"))] as $terminals |
+if ($terminals|length)!=1 or $terminals[0].value.type!="response.completed" or $terminals[0].key!=($events|length)-1
+then error("Search stream did not complete cleanly") else . end |
+$terminals[0].value.response as $response |
+([$events[]|select(.type=="response.output_item.done")|{index:(.output_index//0),item:.item}]+
+ [($response.output//[])|to_entries[]|{index:.key,item:.value}]) |
+# Stable order with full completed items preferred over matching earlier items.
+reduce .[] as $entry ({}; .[($entry.item.id//("index:"+($entry.index|tostring)))]=$entry) |
+[.[]]|sort_by(.index)|map(.item) as $items |
+if any($items[];(.type|IN("web_search_call","message","reasoning")|not))
+then error("Unsupported native search output item") else . end |
+[$items[]|select(.type=="web_search_call")] as $searches |
+if ($searches|length)==0 or any($searches[];.status!="completed" or (.action.type|IN("search","open_page","find_in_page")|not)) then error("Native search was not executed successfully") else . end |
+[$items[]|select(.type=="message")|.content[]|select(.type|IN("output_text","refusal"))] as $parts |
+[$parts[]|(.annotations//[])[]|select(.type=="url_citation")]|length as $sources |
+if $sources==0 then error("Native search returned no source citations") else . end |
+($response.usage//{}) as $u |
+{id:($response.id//"msg_clcd_search"),type:"message",role:"assistant",model:$model,
+ content:([
+   # Claude Code counts executed searches from these blocks, not token usage.
+   # Only confirmed search actions get a record; page opens/finds are not searches.
+   $searches[]|select(.action.type=="search")|
+   (.action.query // ((.action.queries//[])|join(" "))) as $query |
+   if (.id|type)!="string" or (.id|test("^[A-Za-z0-9_-]{1,256}$")|not) or ($query|type)!="string" or ($query|length)==0
+   then error("Native search action lacks an ID or query")
+   else {type:"server_tool_use",id:("srvtoolu_"+.id),name:"web_search",input:{query:$query}} end
+ ]+[$parts[]|{type:"text",text:cited_text}]),stop_reason:"end_turn",stop_sequence:null,
+ usage:{input_tokens:(($u.input_tokens//0)-($u.input_tokens_details.cached_tokens//0)),
+ cache_read_input_tokens:($u.input_tokens_details.cached_tokens//0),cache_creation_input_tokens:0,output_tokens:($u.output_tokens//0),
+ server_tool_use:{web_search_requests:($searches|length)}}}
+JQ
+
+cat >"$runtime/search-sse.jq" <<'JQ'
+def event($t;$b): "event: "+$t+"\ndata: "+({type:$t}+$b|tojson)+"\n\n";
+. as $m |
+event("message_start";{message:($m|.content=[]|.stop_reason=null|.usage.output_tokens=0)}),
+($m.content|to_entries[]|
+ (if .value.type=="server_tool_use" then
+   event("content_block_start";{index:.key,content_block:(.value|.input={})}),
+   event("content_block_delta";{index:.key,delta:{type:"input_json_delta",partial_json:(.value.input|tojson)}})
+  else
+   event("content_block_start";{index:.key,content_block:{type:"text",text:""}}),
+   event("content_block_delta";{index:.key,delta:{type:"text_delta",text:.value.text}})
+  end),
+ event("content_block_stop";{index:.key})),
+event("message_delta";{delta:{stop_reason:$m.stop_reason,stop_sequence:null},usage:$m.usage}),
+event("message_stop";{})
+JQ
+
 cache_name() {
   printf '%s\n%s' "$1" "$2" | openssl dgst -sha256 | awk '{print $NF}'
 }
@@ -363,6 +471,8 @@ read_stream() (
   if [ "$chat_mode" = true ]; then normalize_chat "$1" "$2"; else cat <&8; fi
 )
 stop_upstream() {
+  if [ -n "${search_reader_pid:-}" ]; then kill_tree "$search_reader_pid"; wait "$search_reader_pid" 2>/dev/null || true; search_reader_pid=''; fi
+  if [ -n "${search_monitor_pid:-}" ]; then kill_tree "$search_monitor_pid"; wait "$search_monitor_pid" 2>/dev/null || true; search_monitor_pid=''; fi
   exec 8<&-
   if [ -n "${upstream_pid:-}" ]; then
     kill_tree "$upstream_pid"
@@ -464,6 +574,46 @@ stream_problem() {
   else printf 'Chat response stream was malformed or interrupted.'; fi
 }
 
+
+handle_search() {
+  local conn=$1 selected=$2 stream=$3 curl_code=0 bytes problem last_probe=$SECONDS
+  # Bash 3.2 returns 1 for both read timeout and EOF. A separate EOF watcher
+  # distinguishes a disconnected peer without timing out a healthy slow search.
+  ( cat >/dev/null; : >"$conn/disconnected" ) <&0 &
+  search_monitor_pid=$!
+  head -c 8388609 <&8 >"$conn/search-stream" &
+  search_reader_pid=$!
+  while kill -0 "$search_reader_pid" 2>/dev/null; do
+    if [ -f "$conn/disconnected" ]; then stop_upstream; return; fi
+    # An informational response keeps slow HTTP clients alive and exposes a
+    # closed write side even when socat has not propagated its read-side EOF.
+    if [ "$SECONDS" -gt "$last_probe" ]; then
+      printf 'HTTP/1.1 102 Processing\r\n\r\n' 2>/dev/null || { stop_upstream; return; }
+      last_probe=$SECONDS
+    fi
+    sleep 0.05
+  done
+  wait "$search_reader_pid" || { stop_upstream; http_error '502 Bad Gateway' 'Search stream read failed'; return; }
+  search_reader_pid=''
+  kill_tree "$search_monitor_pid"; wait "$search_monitor_pid" 2>/dev/null || true
+  search_monitor_pid=''
+  bytes=$(wc -c <"$conn/search-stream")
+  if [ "$bytes" -gt 8388608 ]; then stop_upstream; http_error '502 Bad Gateway' 'Search stream exceeded the 8 MiB limit'; return; fi
+  exec 8<&-
+  wait "$upstream_pid" || curl_code=$?
+  upstream_pid=''
+  if [ "$curl_code" -ne 0 ]; then http_error '502 Bad Gateway' 'Search stream was interrupted'; return; fi
+  if ! jq -Rsc --arg model "$selected" -f "$runtime/search-response.jq" "$conn/search-stream" >"$conn/answer" 2>"$conn/search-error"; then
+    problem=$(sed -n 's/^jq: error.*): //p' "$conn/search-error" | head -c 200)
+    http_error '502 Bad Gateway' "${problem:-Invalid native search response}"; return
+  fi
+  if [ "$stream" = true ]; then
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n' || return
+    jq -rj -f "$runtime/search-sse.jq" "$conn/answer" | chunks || return
+    printf '0\r\n\r\n'
+  else http_json '200 OK' "$(cat "$conn/answer")"; fi
+}
+
 handle() {
   local conn=$1 first method path _version header name value length=0 supplied='' body='' stream selected problem curl_code
   local results
@@ -494,7 +644,7 @@ handle() {
   if ! jq -e '.messages|type=="array"' "$conn/input" >/dev/null 2>&1; then http_error '400 Bad Request' 'Expected a messages array'; return; fi
   jq '[(.tools // []) | to_entries[] | {key:.value.name,value:(if (.value.name|test("^[A-Za-z0-9_-]{1,64}$") and (startswith("clcd_tool_")|not)) then .value.name else "clcd_tool_"+(.key|tostring) end)}] | from_entries' "$conn/input" >"$conn/names"
   jq 'to_entries | map({key:.value,value:.key}) | from_entries' "$conn/names" >"$conn/reverse"
-  if ! jq --arg model "$model" --argjson mapping "$model_map" --arg effort "$effort" --arg effort_override "$effort_override" --arg transport "$transport" --slurpfile names "$conn/names" -f "$runtime/request.jq" "$conn/input" >"$conn/request" 2>"$conn/translation-error"; then
+  if ! jq --arg model "$model" --argjson mapping "$model_map" --arg effort "$effort" --arg effort_override "$effort_override" --arg transport "$transport" --arg search_mode "$web_search" --arg search_unbounded "$web_search_unbounded" --slurpfile names "$conn/names" -f "$runtime/request.jq" "$conn/input" >"$conn/request" 2>"$conn/translation-error"; then
     problem=$(sed -n 's/^jq: error.*): //p' "$conn/translation-error" | head -c 300)
     http_error '400 Bad Request' "${problem:-Unsupported Messages content or tool}"; return
   fi
@@ -504,6 +654,9 @@ handle() {
   fi
   stream=$(jq -r '.stream // false' "$conn/input")
   if ! open_upstream "$conn"; then upstream_error "$conn"; return; fi
+  if jq -e 'any(.tools[]?;.type=="web_search")' "$conn/request" >/dev/null; then
+    handle_search "$conn" "$selected" "$stream"; return
+  fi
   if [ "$stream" = true ]; then
     printf 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n' 2>/dev/null || { stop_upstream; return; }
     if read_stream "$conn" "$selected" | jq --unbuffered -Rnj --arg model "$selected" --slurpfile names "$conn/reverse" -f "$runtime/stream.jq" 2>"$conn/stream-error" | chunks; then
@@ -543,7 +696,7 @@ handle() {
 
 clcd_handler() {
   set -euo pipefail
-  local conn upstream_pid='' upstream_status=502
+  local conn upstream_pid='' upstream_status=502 search_reader_pid='' search_monitor_pid=''
   conn=$(mktemp -d "$runtime/request.XXXXXXXX")
   trap 'stop_upstream; rm -rf -- "$conn"' EXIT
   if [ "$transport" = codex ]; then exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out"; fi
@@ -551,7 +704,9 @@ clcd_handler() {
   rm -rf -- "$conn"
   trap - EXIT
 }
+export web_search web_search_unbounded
 export runtime key model effort effort_override transport endpoint api_key chat_mode adapter_dir chat_cache header_timeout model_map
+export -f handle_search
 export -f clcd_handler handle open_upstream stop_upstream upstream_error kill_tree rpc auth http_json http_error chunks cache_name prepare_chat normalize_chat read_stream stream_problem
 socat -d0 "TCP4-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" 'EXEC:/bin/bash -c clcd_handler' 5>&- 6>&- 2>"$runtime/socket-errors" &
 server_pid=$!
@@ -560,20 +715,37 @@ export -n -f clcd_handler handle open_upstream stop_upstream upstream_error kill
 base="http://127.0.0.1:$port"
 ready=false
 for _ in {1..40}; do
-  if result=$(printf 'header = "x-api-key: %s"\n' "$key" | curl --config - --silent --fail --max-time 1 "$base/health") && [ "$result" = '{"status":"clcd"}' ]; then ready=true; break; fi
+  if result=$(printf 'header = "x-api-key: %s"\n' "$key" | curl --config - --noproxy 127.0.0.1 --silent --fail --max-time 1 "$base/health") && [ "$result" = '{"status":"clcd"}' ]; then ready=true; break; fi
   sleep 0.1
 done
 [ "$ready" = true ] || die 'could not start the local bridge'
 
+if [ "${1:-}" = --check-search ]; then
+  [ "$transport" = codex ] && [ "$web_search" != disabled ] || die 'enable Codex web_search before checking search'
+  result=$(printf 'header = "x-api-key: %s"\n' "$key" |
+    curl --config - --noproxy 127.0.0.1 --silent --show-error --fail-with-body --max-time 180 -H 'Content-Type: application/json' \
+      --data "$(jq -cn --arg model "$model" '{model:$model,max_tokens:2048,messages:[{role:"user",content:"Search for the official OpenAI Codex web search documentation. Give a short summary and cite the source."}],tools:[{type:"web_search_20250305",name:"web_search",max_uses:8}],tool_choice:{type:"tool",name:"web_search"}}')" "$base/v1/messages") || {
+    problem=$(printf '%s' "$result" | jq -r '.error.message//"Native search check failed"' 2>/dev/null | head -c 200)
+    die "${problem:-Native search check failed}"
+  }
+  printf '%s' "$result" | jq -e '.usage.server_tool_use.web_search_requests>0 and any(.content[];.type=="text" and (.text|test("\\]\\(https?://")))' >/dev/null || die 'native search check lacks execution evidence or citations'
+  printf '%s' "$result" | jq -c --arg mode "$web_search" --argjson unbounded "$web_search_unbounded" --arg model "$model" '{provider:"codex",model:$model,state:"search-verified",search_executed:true,mode:$mode,unbounded:$unbounded,search_requests:.usage.server_tool_use.web_search_requests}'
+  exit
+fi
+
 if [ "${1:-}" = --check ]; then
   printf 'clcd: checking %s through the selected provider...\n' "$model" >&2
   result=$(printf 'header = "x-api-key: %s"\n' "$key" |
-    curl --config - --silent --show-error --fail --max-time 120 -H 'Content-Type: application/json' \
+    curl --config - --noproxy 127.0.0.1 --silent --show-error --fail --max-time 120 -H 'Content-Type: application/json' \
       --data "$(jq -cn --arg model "$model" '{model:$model,max_tokens:1024,messages:[{role:"user",content:"Reply with exactly CLCD_OK"}]}')" "$base/v1/messages") || die 'provider check failed'
   printf '%s' "$result" | jq -er '[.content[] | select(.type=="text") | .text] | join("") | select(.=="CLCD_OK")' || die 'unexpected provider check response'
   exit
 fi
 
+# A local credential-bearing hop must stay on loopback, including when the
+# caller configured an HTTP proxy for upstream network access.
+export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
 export CLAUDE_CONFIG_DIR="${CLCD_PROFILE:-$HOME/.claude-codex}"
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
 unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS
