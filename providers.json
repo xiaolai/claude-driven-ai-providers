@@ -217,6 +217,27 @@
       "docs": "https://platform.kimi.ai/docs/guide/claude-code-kimi",
       "checked": "2026-10-27",
       "alt_env": "KIMI_API_KEY"
+    },
+    {
+      "id": "kimi-code",
+      "alias": "clkc",
+      "protocol": "anthropic",
+      "auth": "api",
+      "key_env": "KIMI_CODE_API_KEY",
+      "key_file": "kimi-code-api-key",
+      "base_url": "https://api.kimi.com/coding/",
+      "allowed_base_urls": [
+        "https://api.kimi.com/coding/",
+        "https://api.kimi.ai/coding/"
+      ],
+      "models_url": "",
+      "model": "k3.1-pro",
+      "profile": ".claude-kimi-code",
+      "context": 262144,
+      "docs": "https://www.kimi.com/code/docs/third-party-tools/claude-code.html",
+      "checked": "2026-11-05",
+      "effort": "high",
+      "effort_levels": ["low", "medium", "high", "xhigh"]
     }
   ]
 }

@@ -97,11 +97,31 @@ destination to generate its launchers.
 | `lmstudio` | `clms` | Running LM Studio server and loaded model; optional `LM_API_TOKEN` |
 | `minimax` | `clmm` | `MINIMAX_API_KEY` |
 | `zai` | `clza` | `ZAI_API_KEY` for the documented Coding Plan endpoint |
-| `kimi` | `clki` | `MOONSHOT_API_KEY` or `KIMI_API_KEY` |
+| `kimi` | `clki` | Kimi Open Platform key (`MOONSHOT_API_KEY` or `KIMI_API_KEY`); pay-as-you-go |
+| `kimi-code` | `clkc` | Kimi Code Console key (`KIMI_CODE_API_KEY`); membership quota |
 
 `cllds` remains a compatibility alias for `cldls`. Each provider has an isolated
 Claude profile. There is no automatic provider or billing fallback: `clcd` uses
-the subscription route, while `cloa` uses API billing.
+the Codex subscription route, `cloa` uses OpenAI API billing, and `clkc` and
+`clki` use separate Kimi Code membership and Open Platform routes.
+
+To use **Kimi Code membership** in Claude Code, create a key in the
+[Kimi Code Console](https://www.kimi.com/code), then run `./clai prepare kimi-code`.
+Fill the generated private template with that key and apply it with
+`./clai setup --env ~/.config/claude-driven-ai-providers/setup/.env-kimi-code`.
+The launcher is `clkc`; it defaults to the official China endpoint
+`https://api.kimi.com/coding/`. For the overseas endpoint, use
+`./clai config set kimi-code base_url https://api.kimi.ai/coding/` (or set
+`BASE_URL` in the setup template before applying). Only these two official
+Kimi Code endpoints are accepted. The default `k3.1-pro` model uses a 256K
+context setting; choose an eligible model and matching context if your
+membership differs. `clai doctor kimi-code --network` reports
+`no-model-discovery-route` because Kimi's Claude Code guide does not document
+a compatible model-list endpoint. It does **not** prove live generation; use
+`clai check kimi-code --tools` for a live check after setup. That check consumes
+membership quota. Kimi Code membership is intended for eligible developer
+tools, not product backends. [Kimi's Claude Code guide](https://www.kimi.com/code/docs/third-party-tools/claude-code.html)
+documents the endpoint, key, model and context settings.
 
 **The launchers start Claude with `--dangerously-skip-permissions`.** This retains
 the original launch behavior; run them only in a working directory you intend
@@ -109,7 +129,7 @@ Claude to operate on. They preserve the caller's umask and locale.
 
 ### Verification status
 
-Recorded on **2026-10-27**, using the development machine's available accounts:
+Recorded on **2026-10-27** and **2026-11-05**, using the development machine's available accounts:
 
 | Routes | Evidence |
 | --- | --- |
@@ -118,7 +138,8 @@ Recorded on **2026-10-27**, using the development machine's available accounts:
 | Grok | Mock Responses tests passed; verify live model access during setup |
 | Custom local Chat | Mock bridge tests passed; your server/model still needs a tool check |
 | Ollama, LM Studio | Official native routes configured; no live local server qualified |
-| MiniMax, Z.AI, Kimi | Official native routes registered; no live credential qualification |
+| MiniMax, Z.AI, Kimi Open Platform | Official native routes registered; no live credential qualification |
+| Kimi Code membership | Isolated native route and offline integration tests; repository owner reported passing live text and Bash tool checks on 2026-11-05 |
 
 These are measured implementation results, not guarantees about another account
 or model. Official endpoint and authentication sources are recorded in the
