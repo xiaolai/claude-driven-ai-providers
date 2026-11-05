@@ -40,6 +40,8 @@ prepare_setup() (
     printf 'MAPPING_STRATEGY=\nQUALITY_MODEL=\nSTANDARD_MODEL=\nFAST_MODEL=\nOPUS_MODEL=\nFABLE_MODEL=\nSONNET_MODEL=\nHAIKU_MODEL=\nSUBAGENT_MODEL=\nCUSTOM_MODEL=\n'
     if [ "$(printf '%s' "$provider"|jq -r .auth)" = local ]; then
       printf '# Local server root, not /v1/messages or /chat/completions.\nBASE_URL=\nPROTOCOL=%s\n' "$(printf '%s' "$cfg"|jq -r .protocol)"
+    elif printf '%s' "$provider"|jq -e '(.allowed_base_urls//[])|length>0' >/dev/null; then
+      printf '# Choose an official regional Kimi Code endpoint: https://api.kimi.com/coding/ or https://api.kimi.ai/coding/\nBASE_URL=%s\n' "$(printf '%s' "$cfg"|jq -r .base_url)"
     fi
     printf 'BIN_DIR=%s\n' "$bin"
   } >"$stage"

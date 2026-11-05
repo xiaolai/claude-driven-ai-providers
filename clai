@@ -26,8 +26,8 @@ Usage: clai list [--json]
        clai install [--bin DIRECTORY]
 
 Provider IDs and aliases: clai list
-Configuration fields: model, base_url (local only), context, compact, effort,
-max_output_tokens, protocol (local only: anthropic or chat).
+Configuration fields: model, base_url (local or allowlisted Kimi Code region),
+context, compact, effort, max_output_tokens, protocol (local only: anthropic or chat).
 Effort: Codex/OpenAI low/medium/high/xhigh; Gemini low/medium/high.
 Keys are read from provider environment variables, then private mode-600 files.
 No key values are displayed. 'check' invokes a model and can incur API charges.
@@ -120,7 +120,7 @@ validate_config() {
     printf '%s' "$cfg"|jq -e '.effort as $effort | .mapping.bounds.effort_levels==null or (.mapping.bounds.effort_levels|index($effort)!=null)' >/dev/null || fail 'effort is unsupported by one or more mapped models'
   fi
   if [ "$(printf '%s' "$provider"|jq -r .auth)" != local ]; then
-    [ "$(printf '%s' "$cfg"|jq -r .base_url)" = "$(printf '%s' "$provider"|jq -r .base_url)" ] || fail 'cloud endpoints are pinned to their documented official origin'
+    printf '%s' "$provider"|jq -e --arg url "$(printf '%s' "$cfg"|jq -r .base_url)" 'if (.allowed_base_urls//[]|length)>0 then .allowed_base_urls|index($url)!=null else .base_url==$url end' >/dev/null || fail 'cloud endpoints are pinned to their documented official origin'
     [ "$(printf '%s' "$cfg"|jq -r .protocol)" = "$(printf '%s' "$provider"|jq -r .protocol)" ] || fail 'cloud protocol cannot be overridden'
   fi
 }
@@ -264,8 +264,9 @@ run_provider() {
   unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_EFFORT_LEVEL
   if printf '%s' "$cfg"|jq -e '.effort!=null' >/dev/null; then export CLAUDE_CODE_EFFORT_LEVEL="$effort"; fi
   export CLAUDE_CONFIG_DIR="$profile"
-  export ANTHROPIC_BASE_URL="${base%/}" ANTHROPIC_AUTH_TOKEN="${credential:-local-provider}"
-  if [ "$id" = minimax ]; then export ANTHROPIC_API_KEY="$credential"; unset ANTHROPIC_AUTH_TOKEN; fi
+  if [ "$id" = kimi-code ]; then export ANTHROPIC_BASE_URL="$base"; else export ANTHROPIC_BASE_URL="${base%/}"; fi
+  export ANTHROPIC_AUTH_TOKEN="${credential:-local-provider}"
+  if [ "$id" = minimax ] || [ "$id" = kimi-code ]; then export ANTHROPIC_API_KEY="$credential"; unset ANTHROPIC_AUTH_TOKEN; fi
   export ANTHROPIC_MODEL="$selected" ANTHROPIC_DEFAULT_MODEL="$selected"
   export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected" ANTHROPIC_DEFAULT_FABLE_MODEL="$selected" ANTHROPIC_DEFAULT_SONNET_MODEL="$selected" ANTHROPIC_DEFAULT_HAIKU_MODEL="$selected" CLAUDE_CODE_SUBAGENT_MODEL="$selected"
   if [ "$id" = local-deepseek ]; then
@@ -370,7 +371,12 @@ case "$command" in
         if [ "$action" = set ]; then case "$field" in
           context|compact|max_output_tokens) [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] || fail 'expected a positive integer';;
           effort) case "$value" in low|medium|high|xhigh) ;; *) fail 'unsupported effort';; esac;;
-          base_url|protocol) [ "$(printf '%s' "$provider"|jq -r .auth)" = local ] || fail 'only local provider endpoints/protocols are configurable'; if [ "$field" = base_url ]; then credential=''; validate_url "$value"; else case "$value" in anthropic|chat) ;; *) fail 'local protocol must be anthropic or chat';; esac; fi;;
+          base_url|protocol) if [ "$field" = base_url ]; then
+              [ "$(printf '%s' "$provider"|jq -r .auth)" = local ] || printf '%s' "$provider"|jq -e --arg url "$value" '(.allowed_base_urls//[])|index($url)!=null' >/dev/null || fail 'only local or allowlisted Kimi Code endpoints are configurable'
+              credential=''; validate_url "$value"
+            else [ "$(printf '%s' "$provider"|jq -r .auth)" = local ] || fail 'only local protocols are configurable'
+              case "$value" in anthropic|chat) ;; *) fail 'local protocol must be anthropic or chat';; esac
+            fi;;
         esac; fi
         cfg=$(printf '%s' "$provider"|jq -c --argjson changes "$changed" '.+$changes')
         validate_config
