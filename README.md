@@ -129,7 +129,7 @@ Claude to operate on. They preserve the caller's umask and locale.
 
 ### Verification status
 
-Recorded on **2026-10-27**, using the development machine's available accounts:
+Recorded on **2026-10-27** and **2026-11-05**, using the development machine's available accounts:
 
 | Routes | Evidence |
 | --- | --- |
@@ -139,7 +139,7 @@ Recorded on **2026-10-27**, using the development machine's available accounts:
 | Custom local Chat | Mock bridge tests passed; your server/model still needs a tool check |
 | Ollama, LM Studio | Official native routes configured; no live local server qualified |
 | MiniMax, Z.AI, Kimi Open Platform | Official native routes registered; no live credential qualification |
-| Kimi Code membership | Isolated native route and offline integration tests; live membership key/text/tool check pending |
+| Kimi Code membership | Isolated native route and offline integration tests; repository owner reported passing live text and Bash tool checks on 2026-11-05 |
 
 These are measured implementation results, not guarantees about another account
 or model. Official endpoint and authentication sources are recorded in the
