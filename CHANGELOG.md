@@ -10,6 +10,10 @@
 - Validate hosted search versions and restrictions, require explicit opt-in to waive the unsupported max_uses:8 limit, and report the effective policy in diagnostics.
 - Buffer and validate search SSE before returning clickable citations; cover incomplete streams, duplicate terminals, cancellation, response limits and Unicode/multiple citations.
 - Add explicit search checks and private setup fields; leave other provider routes and normal function-tool streaming unchanged.
+- Add an isolated `kimi-code` / `clkc` membership route, with its own key and an official China/overseas endpoint allowlist, separate from Open Platform `clki`.
+- Add `CLAI_SKIP_PERMISSIONS=0` so launchers can omit `--dangerously-skip-permissions`.
+- Add `clai profile link` to opt selected `~/.claude` items into one provider profile.
+- Document that `clcd` does not serve the auto-mode classifier, so those checks fail closed.
 
 ## 0.1.1
 

@@ -169,4 +169,8 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-flash[1m]'
 export CLAUDE_CODE_SUBAGENT_MODEL='deepseek-flash[1m]'
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW='786432'
 
-exec "$claude_bin" --dangerously-skip-permissions "$@"
+case "${CLAI_SKIP_PERMISSIONS:-1}" in
+  1|true|yes) exec "$claude_bin" --dangerously-skip-permissions "$@";;
+  0|false|no) exec "$claude_bin" "$@";;
+  *) printf 'clds: CLAI_SKIP_PERMISSIONS must be 1 or 0\n' >&2; exit 1;;
+esac

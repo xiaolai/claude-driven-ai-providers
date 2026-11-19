@@ -67,6 +67,14 @@ An obsolete effort override can be removed with `clai config unset
 PROVIDER effort`. Environment overrides can still affect future launches; report
 any conflict and resolve the launch environment explicitly without printing it.
 
+Launchers pass `--dangerously-skip-permissions` unless the user sets
+`CLAI_SKIP_PERMISSIONS=0`. Leave the default unless they ask to keep Claude
+Code's permission prompts. Provider profiles do not inherit `~/.claude`. When
+the user asks to reuse global instructions or skills, run
+`clai profile link PROVIDER --items CLAUDE.md,skills`. Include `settings.json`
+only when they explicitly want that profile's hooks and permission rules.
+Do not copy credentials into a profile.
+
 Summarize provider, installed command/destination, credential source (never its
 value), diagnostics and whether tool use was measured. Preserve the private
 input for reuse. Do not commit or upload filled setup files. Do not commit source

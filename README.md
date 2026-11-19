@@ -123,9 +123,36 @@ membership quota. Kimi Code membership is intended for eligible developer
 tools, not product backends. [Kimi's Claude Code guide](https://www.kimi.com/code/docs/third-party-tools/claude-code.html)
 documents the endpoint, key, model and context settings.
 
-**The launchers start Claude with `--dangerously-skip-permissions`.** This retains
-the original launch behavior; run them only in a working directory you intend
-Claude to operate on. They preserve the caller's umask and locale.
+**The launchers start Claude with `--dangerously-skip-permissions` unless
+`CLAI_SKIP_PERMISSIONS=0`** (`false` and `no` also omit the flag; `1`, `true`,
+and `yes` keep it). The default retains the original launch behavior. Run them
+only in a working directory you intend Claude to operate on. They preserve the
+caller's umask and locale. An invalid value refuses to start. A provider
+profile can also set `"permissions": {"disableBypassPermissionsMode": "disable"}`
+in its `settings.json`; Claude Code then ignores the flag and uses that
+profile's permission mode.
+
+With bypass disabled, interactive Claude Code may start in auto mode. `clcd`
+does not implement the [auto-mode classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing)
+endpoint, so a classifier check fails closed and the action is not run. Set
+`permissions.defaultMode` in the provider profile when you need a mode that
+does not ask that classifier.
+
+Provider profiles do not inherit `~/.claude`. Link selected items when you want
+them on one route:
+
+```bash
+clai profile link codex --items CLAUDE.md,skills
+clai profile show codex
+clai profile unlink codex --items CLAUDE.md
+```
+
+Allowed items are `CLAUDE.md`, `skills`, `commands`, `agents`, and
+`settings.json`. Each link is a symlink. `settings.json` can carry hooks and
+permission rules written for Claude models, so name it only when those rules
+should apply to this provider. The command does not replace a real file or a
+symlink that points somewhere else. Profiles otherwise start empty; project
+`CLAUDE.md` and `AGENTS.md` in the working tree still apply.
 
 ### Verification status
 

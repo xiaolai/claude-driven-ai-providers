@@ -23,6 +23,7 @@ Search responses are buffered up to 8 MiB and include clickable citations.
 CLCD_HEADER_TIMEOUT: upstream response-header deadline (default: 120 seconds).
 CLAUDE_CODE_AUTO_COMPACT_WINDOW: default 750000 tokens (75% of 1M).
 Claude profile: ~/.claude-codex. Permission checks are bypassed, as in clds.
+CLAI_SKIP_PERMISSIONS=0 omits --dangerously-skip-permissions.
 
 Requires macOS bash, curl, jq, socat, openssl, lockf, codex, and claude.
 No external proxy, SDK, or persistent subscription token copy.
@@ -802,7 +803,11 @@ unset CLCD_API_KEY OPENAI_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY LOCA
 unset CLCD_CONFIG_RESOLVED CLCD_MODEL_MAP
 umask "$caller_umask"
 if [ "$caller_lc_all_set" = x ]; then export LC_ALL="$caller_lc_all"; else unset LC_ALL; fi
-"$claude_bin" --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &
+case "${CLAI_SKIP_PERMISSIONS:-1}" in
+  1|true|yes) "$claude_bin" --dangerously-skip-permissions "$@" <&0 5>&- 6>&- &;;
+  0|false|no) "$claude_bin" "$@" <&0 5>&- 6>&- &;;
+  *) die 'CLAI_SKIP_PERMISSIONS must be 1 or 0';;
+esac
 claude_pid=$!
 set +e
 wait "$claude_pid"

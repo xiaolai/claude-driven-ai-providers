@@ -80,4 +80,8 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export API_TIMEOUT_MS="${CLDLS_API_TIMEOUT_MS:-${CLLDS_API_TIMEOUT_MS:-7200000}}"
 
 mkdir -p "$CLAUDE_CONFIG_DIR"
-exec "$claude_bin" --dangerously-skip-permissions "$@"
+case "${CLAI_SKIP_PERMISSIONS:-1}" in
+  1|true|yes) exec "$claude_bin" --dangerously-skip-permissions "$@";;
+  0|false|no) exec "$claude_bin" "$@";;
+  *) printf 'cldls: CLAI_SKIP_PERMISSIONS must be 1 or 0\n' >&2; exit 1;;
+esac

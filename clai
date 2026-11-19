@@ -23,6 +23,8 @@ Usage: clai list [--json]
        clai config set PROVIDER FIELD VALUE
        clai config unset PROVIDER FIELD
        clai key set PROVIDER [--stdin]
+       clai profile link|unlink PROVIDER --items CLAUDE.md,skills
+       clai profile show PROVIDER
        clai install [--bin DIRECTORY]
 
 Provider IDs and aliases: clai list
@@ -33,7 +35,9 @@ Effort: Codex/OpenAI low/medium/high/xhigh; Gemini low/medium/high.
 Keys are read from provider environment variables, then private mode-600 files.
 No key values are displayed. 'check' invokes a model and can incur API charges.
 Cloud context defaults: declared 1M, auto-compaction 75%; backend limits apply.
-Existing permission-bypass behavior is retained; providers never auto-fallback.
+Launchers pass --dangerously-skip-permissions unless CLAI_SKIP_PERMISSIONS=0.
+Provider profiles stay isolated; profile link opts in to selected ~/.claude items.
+Providers never auto-fallback.
 HELP
 }
 command -v jq >/dev/null || fail 'jq is required'
@@ -311,7 +315,79 @@ run_provider() {
   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ENABLE_TOOL_SEARCH=false
   scrub_provider_keys
   umask "$caller_umask"
-  exec "$claude_bin" --dangerously-skip-permissions "$@"
+  case "${CLAI_SKIP_PERMISSIONS:-1}" in
+    1|true|yes) exec "$claude_bin" --dangerously-skip-permissions "$@";;
+    0|false|no) exec "$claude_bin" "$@";;
+    *) fail 'CLAI_SKIP_PERMISSIONS must be 1 or 0';;
+  esac
+}
+profile_root() {
+  local name
+  name=$(printf '%s' "$provider" | jq -r .profile)
+  case "$name" in .claude-[A-Za-z0-9._-]*) ;; *) fail 'provider profile name is invalid';; esac
+  printf '%s/%s\n' "$HOME" "$name"
+}
+link_profile() {
+  local action=$1 name=$2 items='' item source dest current source_root dest_root seen=' ' IFS=','
+  local -a parts=()
+  shift 2
+  [ -n "$name" ] && [ "${1:-}" = --items ] && [ -n "${2:-}" ] && [ "$#" -eq 2 ] || fail "usage: clai profile $action PROVIDER --items CLAUDE.md,skills"
+  items=$2
+  read -r -a parts <<<"$items"
+  [ "${#parts[@]}" -gt 0 ] || fail 'name at least one profile item'
+  for item in "${parts[@]}"; do
+    case "$item" in
+      CLAUDE.md|skills|commands|agents|settings.json) ;;
+      *) fail 'profile items must be chosen from CLAUDE.md, skills, commands, agents, settings.json';;
+    esac
+    case "$seen" in *" $item "*) fail 'duplicate profile item';; esac
+    seen="$seen$item "
+  done
+  select_provider "$name" key
+  source_root="$HOME/.claude"
+  [ ! -L "$source_root" ] && [ -d "$source_root" ] || fail "$HOME/.claude must be a real directory"
+  [ "$(stat -f '%u' "$source_root")" = "$(id -u)" ] || fail "$HOME/.claude must be owned by you"
+  dest_root=$(profile_root)
+  [ ! -L "$dest_root" ] || fail 'provider profile must be a real directory, not a symlink'
+  mkdir -p "$dest_root"
+  chmod 700 "$dest_root"
+  [ ! -L "$dest_root" ] && [ -d "$dest_root" ] || fail 'provider profile must be a real directory'
+  for item in "${parts[@]}"; do
+    source="$source_root/$item"
+    dest="$dest_root/$item"
+    if [ "$action" = unlink ]; then
+      if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then continue; fi
+      [ -L "$dest" ] || fail "$item in the provider profile is not an inheritance symlink"
+      rm -- "$dest"
+      continue
+    fi
+    [ -e "$source" ] || fail "$item is missing from $HOME/.claude"
+    [ "$(stat -f '%u' "$source")" = "$(id -u)" ] || fail "$item in $HOME/.claude must be owned by you"
+    if [ -L "$dest" ]; then
+      current=$(readlink "$dest")
+      [ "$current" = "$source" ] || fail "$item already links somewhere else; unlink it first"
+      continue
+    fi
+    [ ! -e "$dest" ] || fail "$item already exists in the provider profile and is not a symlink"
+    ln -s "$source" "$dest"
+  done
+  if [ "$action" = unlink ]; then
+    printf 'Removed requested inheritance links from %s.\n' "${dest_root#"$HOME/"}"
+  else
+    printf 'Linked requested items into %s from %s/.claude.\n' "${dest_root#"$HOME/"}" "$HOME"
+  fi
+}
+show_profile() {
+  local name=$1 dest_root item target
+  select_provider "$name" key
+  dest_root=$(profile_root)
+  printf 'profile %s\n' "${dest_root#"$HOME/"}"
+  for item in CLAUDE.md skills commands agents settings.json; do
+    if [ -L "$dest_root/$item" ]; then
+      target=$(readlink "$dest_root/$item")
+      printf 'linked %s -> %s\n' "$item" "$target"
+    fi
+  done
 }
 install_runtime() {
   local bin=${1:-$HOME/.local/bin} data stage release alias target qtarget
@@ -405,6 +481,13 @@ case "$command" in
     mkdir -p "$config_root"; chmod 700 "$config_root"
     stage=$(mktemp "$config_root/.${file}.XXXXXXXX"); printf '%s\n' "$secret" >"$stage"; chmod 600 "$stage"; mv -f "$stage" "$config_root/$file"; unset secret
     printf 'Stored private credential for %s; value not displayed.\n' "$id";;
+  profile)
+    action=${1:-}; name=${2:-}
+    case "$action" in
+      link|unlink) link_profile "$action" "$name" "${@:3}";;
+      show) [ -n "$name" ] && [ "$#" -eq 2 ] || fail 'usage: clai profile show PROVIDER'; show_profile "$name";;
+      *) fail 'usage: clai profile link|unlink|show PROVIDER [--items CLAUDE.md,skills]';;
+    esac;;
   check)
     [ -n "${1:-}" ] || fail 'usage: clai check PROVIDER [--tools]'
     name=$1;shift;tool_check='';check_model='';check_effort='';check_context='';check_output='';search_check=false;check_args=()
