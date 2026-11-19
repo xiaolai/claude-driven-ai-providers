@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Patch release of the current main line. Behavior matches 0.1.2; that section lists the process-tree fix, Codex web search, Kimi Code route, permission opt-out, and profile links.
+
 ## 0.1.2
 
 - Bound `clcd`'s process-tree cleanup: replace unbounded recursion with an iterative, visited-set traversal capped at 4096 nodes. Deep or stale PID ancestry could exhaust the 8 MB bash stack, leave bridge handlers orphaned, and trigger a fork/pre-exec crash storm.
