@@ -142,9 +142,37 @@ port=$((40000 + RANDOM % 20000))
 auth_pid='' server_pid='' claude_pid=''
 
 kill_tree() {
-  local pid=$1 child
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
-  kill "$pid" 2>/dev/null || true
+  local root=${1:-} cur child n=0
+  local queue seen
+  case "$root" in ''|*[!0-9]*) return 0;; esac
+  [ "$root" -gt 1 ] || return 0
+  [ "$root" -ne "$$" ] || return 0
+  # Kill helpers can outlive their caller; never recurse without a bound.
+  [ "${#FUNCNAME[@]}" -le 16 ] || return 0
+  local -a pids=()
+  queue=$root
+  seen=" $root "
+  while [ "$n" -lt 4096 ]; do
+    queue=${queue# }
+    [ -n "$queue" ] || break
+    cur=${queue%% *}
+    case "$queue" in *' '*) queue=${queue#* };; *) queue='';; esac
+    pids[${#pids[@]}]=$cur
+    n=$((n + 1))
+    for child in $(pgrep -P "$cur" 2>/dev/null || true); do
+      case "$child" in ''|*[!0-9]*) continue;; esac
+      [ "$child" -gt 1 ] && [ "$child" -ne "$$" ] || continue
+      case "$seen" in *" $child "*) continue;; esac
+      seen="$seen$child "
+      queue="$queue $child"
+    done
+  done
+  # Reverse breadth-first order: terminate leaves before their ancestors.
+  n=${#pids[@]}
+  while [ "$n" -gt 0 ]; do
+    n=$((n - 1))
+    kill -TERM "${pids[$n]}" 2>/dev/null || true
+  done
 }
 cleanup() {
   trap - EXIT INT TERM HUP
@@ -363,12 +391,12 @@ read_stream() (
   if [ "$chat_mode" = true ]; then normalize_chat "$1" "$2"; else cat <&8; fi
 )
 stop_upstream() {
-  exec 8<&-
-  if [ -n "${upstream_pid:-}" ]; then
-    kill_tree "$upstream_pid"
-    wait "$upstream_pid" 2>/dev/null || true
-    upstream_pid=''
-  fi
+  local pid=${upstream_pid:-}
+  exec 8<&- 2>/dev/null || true
+  upstream_pid=''
+  [ -n "$pid" ] || return 0
+  kill_tree "$pid"
+  wait "$pid" 2>/dev/null || true
 }
 open_upstream() {
   local conn=$1 status token account attempt deadline allowed_protocols='=https'
@@ -467,6 +495,8 @@ stream_problem() {
 handle() {
   local conn=$1 first method path _version header name value length=0 supplied='' body='' stream selected problem curl_code
   local results
+  # The main bridge removes the runtime on exit; don't serve detached requests.
+  [ -d "$runtime" ] || return 1
   IFS= read -r first || return
   read -r method path _version <<<"$first"
   path=${path%%\?*}
@@ -543,17 +573,19 @@ handle() {
 
 clcd_handler() {
   set -euo pipefail
-  local conn upstream_pid='' upstream_status=502
-  conn=$(mktemp -d "$runtime/request.XXXXXXXX")
-  trap 'stop_upstream; rm -rf -- "$conn"' EXIT
-  if [ "$transport" = codex ]; then exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out"; fi
+  local conn='' upstream_pid='' upstream_status=502
+  trap 'stop_upstream; [ -z "$conn" ] || rm -rf -- "$conn"; exec 5>&- 6>&- 2>/dev/null || true' EXIT
+  trap 'exit 143' TERM HUP
+  [ -d "$runtime" ] || exit 1
+  conn=$(mktemp -d "$runtime/request.XXXXXXXX") || exit 1
+  if [ "$transport" = codex ]; then exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out" || exit 1; fi
   handle "$conn" || true
   rm -rf -- "$conn"
   trap - EXIT
 }
 export runtime key model effort effort_override transport endpoint api_key chat_mode adapter_dir chat_cache header_timeout model_map
 export -f clcd_handler handle open_upstream stop_upstream upstream_error kill_tree rpc auth http_json http_error chunks cache_name prepare_chat normalize_chat read_stream stream_problem
-socat -d0 "TCP4-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" 'EXEC:/bin/bash -c clcd_handler' 5>&- 6>&- 2>"$runtime/socket-errors" &
+socat -d0 -t 5 "TCP4-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" 'EXEC:/bin/bash -c clcd_handler' 5>&- 6>&- 2>"$runtime/socket-errors" &
 server_pid=$!
 export -n runtime key model effort effort_override transport endpoint api_key chat_mode adapter_dir chat_cache header_timeout model_map
 export -n -f clcd_handler handle open_upstream stop_upstream upstream_error kill_tree rpc auth http_json http_error chunks cache_name prepare_chat normalize_chat read_stream stream_problem
