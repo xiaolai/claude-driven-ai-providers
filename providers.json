@@ -3,6 +3,8 @@
   "providers": [
     {
       "id": "codex",
+      "web_search": "disabled",
+      "web_search_unbounded": false,
       "alias": "clcd",
       "protocol": "responses",
       "auth": "subscription",
