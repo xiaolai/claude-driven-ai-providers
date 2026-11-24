@@ -47,10 +47,16 @@ You can also use the commands directly; both paths use the same setup logic.
 
 ### Requirements
 
-Currently supported on **macOS** with Bash 3.2, Claude Code, curl, jq, and openssl.
-Bridge routes also need socat. The Codex subscription route additionally needs
-Codex CLI, macOS lockf, and a ChatGPT subscription login through `codex login`.
-Ask Claude to check these prerequisites before setup. Linux is not qualified.
+The provider manager and existing command family are qualified on **macOS** with
+Bash 3.2, Claude Code, curl, jq, and openssl. Bridge routes also need socat. The
+existing Codex route additionally needs Codex CLI, macOS `lockf`, and a ChatGPT
+subscription login through `codex login`. Ask Claude to check these prerequisites
+before setup. Linux is not qualified.
+
+A separate, experimental Windows Codex-only entry point, `clcd-win.ps1`, is also
+provided. It requires Windows PowerShell 5.1+, Node.js 18+, Claude Code, Codex CLI,
+and an active ChatGPT subscription login from `codex login`. This does **not** make
+`clai`, the other provider launchers, or the full setup workflow Windows-supported.
 
 ### Which Claude executable runs
 
@@ -198,6 +204,28 @@ cloa --model YOUR_MODEL
 Claude arguments are forwarded literally. Launcher `--help` shows usage;
 managed launchers also show Claude's options. For the complete management
 interface, run `clai --help`.
+
+### Windows Codex CLI route
+
+From a PowerShell prompt in the checkout, authenticate Codex CLI once and launch
+the separate Windows bridge:
+
+```powershell
+codex login
+.\clcd-win.ps1
+```
+
+Use `codex login status` to inspect the active Codex CLI login. The bridge refuses
+to start unless Codex app-server reports a ChatGPT subscription login. To verify
+connectivity with a short prompt, run `.\clcd-win.ps1 --check`.
+
+`clcd-win.ps1` uses a dedicated Claude profile at
+`$HOME\.claude-codex-cli` by default and does not read or copy Codex credential
+files. The existing `cdn` command remains a separate CLIProxyAPI route and is not
+modified or used as a fallback. This Windows entry point currently supports only
+the Codex subscription bridge; its Messages compatibility limits match the
+existing `clcd` route, including approximate token counting and rejection of
+unsupported sampling, stop-sequence, structured-output, and fixed-thinking controls.
 
 | Command | Purpose |
 | --- | --- |
